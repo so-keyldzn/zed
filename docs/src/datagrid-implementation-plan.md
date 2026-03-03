@@ -1582,8 +1582,18 @@ Register a new settings type following Zed's hierarchical settings system.
 Supports both global (`~/.config/zed/settings.json`) and project-level
 (`.zed/settings.json`) configuration.
 
+**Steps:**
+1. Create `crates/database_core/src/settings.rs`
+2. Define `DatabaseSettings` struct with `#[derive(RegisterSetting)]`
+3. Create `crates/database_core/src/settings/default.json` with default values
+4. Register in `database_ui.rs` init via `SettingsStore::register::<DatabaseSettings>()`
+5. Add JSON schema entries for `settings.json` documentation
+
 ```rust
+// crates/database_core/src/settings.rs
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, RegisterSetting)]
+#[setting(schema_only)]
 pub struct DatabaseSettings {
     pub page_size: usize,                              // Rows per page (default: 500)
     pub default_sort_mode: SortMode,                   // Server or Client
@@ -1600,6 +1610,38 @@ pub struct DatabaseSettings {
     pub show_quick_actions_toolbar: bool,               // Floating toolbar on cell select
     pub tab_naming_prefix: Option<String>,              // Comment prefix for tab naming
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct NumberFormatSettings {
+    pub decimal_separator: char,      // '.' or ','
+    pub grouping_separator: Option<char>, // ',' or ' ' or None
+    pub grouping_size: usize,         // Usually 3
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub enum SortMode { Server, Client }
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub enum ExportFormat { Csv, Tsv, Json, SqlInsert, SqlDdlDml, Html, Markdown, Excel }
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema)]
+pub enum IntrospectionLevel { Names = 1, Columns = 2, FullDdl = 3 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectionConfig {
+    pub id: String,                   // UUID
+    pub name: String,
+    pub driver: DriverType,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub database: Option<String>,
+    pub user: Option<String>,
+    pub color_index: usize,           // Index into CONNECTION_COLORS
+    pub read_only: bool,
+    pub ssh: Option<SshTunnelConfig>,
+    pub ssl: Option<SslConfig>,
+    pub sqlite_path: Option<String>,
+}
 ```
 
 ### 0.2 Credential storage via CredentialsProvider
@@ -1607,45 +1649,595 @@ pub struct DatabaseSettings {
 Database passwords stored securely via platform keychain, following the pattern
 in `crates/language_model/src/api_key.rs`.
 
+**Steps:**
+1. Create `crates/database_core/src/credential.rs`
+2. Implement `DatabaseCredential` with `CredentialsProvider` integration
+3. Implement priority chain: env var > keychain > prompt
+4. Add password caching in memory (cleared on disconnect)
+
 ```rust
+// crates/database_core/src/credential.rs
+
 pub struct DatabaseCredential {
     pub connection_id: ConnectionId,
     url: SharedString,               // "zed-db://<connection-name>" as keychain key
     load_status: CredentialLoadStatus,
 }
-```
 
-Priority: env var `DB_PASSWORD_<CONNECTION_NAME>` > keychain > prompt user.
+pub enum CredentialLoadStatus {
+    NotLoaded,
+    Loading(Task<()>),
+    Loaded(String),              // Password in memory
+    Failed(String),              // Error message
+}
 
-### 0.3 DatabaseError types + notification integration
+impl DatabaseCredential {
+    pub fn new(connection_id: ConnectionId) -> Self { /* ... */ }
 
-```rust
-pub enum DatabaseError {
-    ConnectionFailed { host: String, port: u16, cause: String },
-    AuthenticationFailed { user: String },
-    QueryTimeout { sql_preview: String, duration: Duration },
-    QueryFailed { sql_preview: String, db_error: String, position: Option<usize> },
-    ConnectionLost { was_in_transaction: bool },
-    SslError { cause: String },
-    SshTunnelFailed { cause: String },
-    LobSizeExceeded { actual: usize, limit: usize, column: String },
+    /// Load credential with priority: env var > keychain > prompt user
+    pub async fn load(&mut self, cx: &mut AsyncApp) -> Result<String> {
+        // 1. Check env var DB_PASSWORD_<CONNECTION_NAME>
+        // 2. Check platform keychain via CredentialsProvider
+        // 3. If not found, prompt user via modal
+        todo!()
+    }
+
+    /// Save to platform keychain
+    pub async fn save(&self, password: &str, cx: &mut AsyncApp) -> Result<()> {
+        todo!()
+    }
+
+    /// Delete from keychain
+    pub async fn delete(&self, cx: &mut AsyncApp) -> Result<()> {
+        todo!()
+    }
 }
 ```
 
-Each error displays in Zed's notification bar with contextual actions
-("Retry", "Edit Connection", "Show Details", "Load Full Content" for LOB).
+### 0.3 DatabaseError types + notification integration
+
+**Steps:**
+1. Create `crates/database_core/src/errors.rs`
+2. Define all error variants with structured data
+3. Implement `Display`, `Error`, conversion traits
+4. Implement `DatabaseError::notify()` for UI notification with actions
+
+```rust
+// crates/database_core/src/errors.rs
+
+#[derive(Debug, thiserror::Error)]
+pub enum DatabaseError {
+    #[error("Connection failed to {host}:{port}: {cause}")]
+    ConnectionFailed { host: String, port: u16, cause: String },
+
+    #[error("Authentication failed for user '{user}'")]
+    AuthenticationFailed { user: String },
+
+    #[error("Query timed out after {duration:?}")]
+    QueryTimeout { sql_preview: String, duration: Duration },
+
+    #[error("Query failed: {db_error}")]
+    QueryFailed {
+        sql_preview: String,
+        db_error: String,
+        position: Option<usize>,  // Byte offset in SQL for cursor positioning
+    },
+
+    #[error("Connection lost{}", if *.was_in_transaction { " (transaction in progress)" } else { "" })]
+    ConnectionLost { was_in_transaction: bool },
+
+    #[error("SSL error: {cause}")]
+    SslError { cause: String },
+
+    #[error("SSH tunnel failed: {cause}")]
+    SshTunnelFailed { cause: String },
+
+    #[error("LOB size exceeded: {actual} bytes (limit: {limit}) in column '{column}'")]
+    LobSizeExceeded { actual: usize, limit: usize, column: String },
+
+    #[error("Driver not found: {driver}")]
+    DriverNotFound { driver: String },
+
+    #[error("Operation cancelled")]
+    Cancelled,
+}
+
+impl DatabaseError {
+    /// Show error in Zed's notification system with contextual actions
+    pub fn notify(&self, cx: &mut App) {
+        match self {
+            Self::ConnectionFailed { .. } => {
+                // Notification with "Retry" and "Edit Connection" buttons
+            }
+            Self::QueryFailed { position, .. } => {
+                // Notification with "Go to Error" action if position is Some
+            }
+            Self::ConnectionLost { was_in_transaction } => {
+                // Notification with "Reconnect" action
+                // Warning about pending transaction if applicable
+            }
+            Self::LobSizeExceeded { .. } => {
+                // Notification with "Load Full Content" action
+            }
+            _ => { /* Standard error notification */ }
+        }
+    }
+
+    /// Convert to a user-facing error banner element for inline display
+    pub fn to_error_banner(&self, cx: &App) -> AnyElement {
+        todo!()
+    }
+}
+```
 
 ### 0.4 Database icon in Zed icon system
 
-Add `IconName::Database` and related icons (Table, Column, Key, Index, View,
-Function, Schema, Connection) to `crates/ui/src/components/icon.rs`.
+**Steps:**
+1. Add SVG icons to `assets/icons/` for each database object type
+2. Register new `IconName` variants in `crates/ui/src/components/icon.rs`
+3. Test rendering at all icon sizes (`XSmall`, `Small`, `Medium`, `Large`)
+
+New `IconName` variants needed:
+
+```rust
+// Added to the IconName enum in crates/ui/src/components/icon.rs
+DatabaseZap,        // Connected database (existing)
+Database,           // Disconnected database (existing)
+Table,              // Table object (new SVG)
+Column,             // Column (new SVG, or reuse Minus)
+KeyRound,           // Primary key column (new SVG)
+ArrowUpRight,       // Foreign key column (existing)
+Schema,             // Schema (new SVG, or reuse Layers)
+Sequence,           // Sequence (new SVG, or reuse Hash)
+StoredProcedure,    // Function/procedure (reuse Code)
+```
 
 ### 0.5 Test infrastructure
 
-- Mock `DatabaseConnection` trait implementation for unit tests
-- SQLite in-memory connections for integration tests
-- GPUI test helpers for panel and grid visual tests
-- `cx.background_executor().timer()` for async test timeouts (per CLAUDE.md)
+**Steps:**
+1. Create `crates/database_core/src/tests/` directory
+2. Implement `MockDatabaseConnection` for unit tests
+3. Create `TestConnectionFactory` for SQLite in-memory
+4. Create GPUI test helpers in `crates/database_ui/src/tests/`
+
+```rust
+// crates/database_core/src/tests/mock_connection.rs
+
+pub struct MockDatabaseConnection {
+    pub query_results: HashMap<String, QueryResult>,
+    pub schema: Vec<SchemaObject>,
+    pub execute_log: Arc<Mutex<Vec<String>>>,
+    pub should_fail: Option<DatabaseError>,
+    pub latency: Option<Duration>,
+}
+
+#[async_trait]
+impl DatabaseConnection for MockDatabaseConnection {
+    async fn execute_query(&self, sql: &str) -> Result<QueryResult> {
+        if let Some(latency) = self.latency {
+            smol::Timer::after(latency).await;
+        }
+        if let Some(error) = &self.should_fail {
+            return Err(anyhow::anyhow!("{}", error));
+        }
+        self.execute_log.lock().push(sql.to_string());
+        self.query_results.get(sql)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No mock result for: {}", sql))
+    }
+
+    async fn execute_statement(&self, sql: &str) -> Result<u64> {
+        self.execute_log.lock().push(sql.to_string());
+        Ok(1)
+    }
+
+    async fn cancel(&self) -> Result<()> { Ok(()) }
+
+    async fn introspect_names(&self) -> Result<Vec<SchemaObject>> {
+        Ok(self.schema.clone())
+    }
+
+    async fn introspect_columns(&self, table: &TableRef) -> Result<Vec<ColumnInfo>> {
+        todo!()
+    }
+
+    async fn introspect_ddl(&self, object: &SchemaObject) -> Result<String> {
+        todo!()
+    }
+
+    async fn foreign_keys(&self, table: &TableRef) -> Result<Vec<ForeignKey>> {
+        Ok(vec![])
+    }
+
+    async fn indexes(&self, table: &TableRef) -> Result<Vec<IndexInfo>> {
+        Ok(vec![])
+    }
+
+    async fn explain(&self, sql: &str) -> Result<ExplainPlan> {
+        todo!()
+    }
+
+    async fn execute_ddl(&self, sql: &str) -> Result<()> {
+        self.execute_log.lock().push(sql.to_string());
+        Ok(())
+    }
+}
+
+// Helper to build mock connections quickly in tests
+pub struct MockConnectionBuilder {
+    connection: MockDatabaseConnection,
+}
+
+impl MockConnectionBuilder {
+    pub fn new() -> Self { /* ... */ }
+    pub fn with_result(mut self, sql: &str, result: QueryResult) -> Self { /* ... */ }
+    pub fn with_schema(mut self, objects: Vec<SchemaObject>) -> Self { /* ... */ }
+    pub fn with_latency(mut self, duration: Duration) -> Self { /* ... */ }
+    pub fn with_failure(mut self, error: DatabaseError) -> Self { /* ... */ }
+    pub fn build(self) -> Box<dyn DatabaseConnection> { /* ... */ }
+}
+```
+
+```rust
+// crates/database_ui/src/tests/helpers.rs
+
+/// Create a test workspace with database panels registered
+pub fn init_test_workspace(cx: &mut VisualTestContext) -> Entity<Workspace> {
+    // 1. Build test project
+    // 2. Create workspace
+    // 3. Register DatabaseExplorer and ValueEditor panels
+    // 4. Register toolbar items
+    // 5. Return workspace entity
+    todo!()
+}
+
+/// Create a QueryEditor with a mock connection for testing
+pub fn create_test_query_editor(
+    workspace: &Entity<Workspace>,
+    connection: Box<dyn DatabaseConnection>,
+    cx: &mut VisualTestContext,
+) -> Entity<QueryEditor> {
+    todo!()
+}
+
+/// Assert that a ResultGrid displays the expected data
+pub fn assert_grid_contents(
+    grid: &Entity<ResultGrid>,
+    expected_columns: &[&str],
+    expected_rows: &[Vec<&str>],
+    cx: &App,
+) {
+    todo!()
+}
+```
+
+### 0.6 Action definitions
+
+**Steps:**
+1. Create `crates/database_ui/src/actions.rs`
+2. Define all actions using `actions!()` macro and `#[derive(Action)]`
+3. Register default keybindings in `crates/database_ui/src/key_bindings.rs`
+
+```rust
+// crates/database_ui/src/actions.rs
+
+actions!(
+    database,
+    [
+        // Panel toggles
+        ToggleDatabaseExplorer,
+        ToggleValueEditor,
+
+        // Query execution
+        ExecuteQuery,
+        CancelQuery,
+        ExplainQuery,
+        FormatQuery,
+
+        // Grid navigation
+        ToggleRecordView,
+        DetachResultGrid,
+        NextPage,
+        PreviousPage,
+        SelectAll,
+        ExpandSelection,
+        ShrinkSelection,
+
+        // Data editing
+        EditCell,
+        SetCellNull,
+        AddRow,
+        CloneRow,
+        DeleteSelectedRows,
+        CommitPendingChanges,
+        RevertPendingChanges,
+        UndoDataEdit,
+        RedoDataEdit,
+
+        // Explorer actions
+        RefreshExplorer,
+        NewQueryConsole,
+        OpenTableData,
+        EditTableData,
+        CopyQualifiedName,
+        FilterExplorerObjects,
+
+        // Connection
+        NewConnection,
+        EditConnection,
+        DisconnectConnection,
+        ReconnectConnection,
+        TestConnection,
+
+        // Export
+        ExportResults,
+        CopyAsSql,
+        CopyAsCsv,
+        CopyAsJson,
+
+        // Column actions
+        SortAscending,
+        SortDescending,
+        ClearSort,
+        FilterColumn,
+        HideColumn,
+        ShowAllColumns,
+        ResizeColumnToFit,
+        ColumnListSearch,
+    ]
+);
+
+/// Action with data: sort by specific column
+#[derive(Clone, PartialEq, Debug, Deserialize, Action)]
+pub struct SortByColumn {
+    pub column_index: usize,
+    pub direction: SortDirection,
+}
+
+/// Action with data: navigate to foreign key target
+#[derive(Clone, PartialEq, Debug, Deserialize, Action)]
+pub struct NavigateToForeignKey {
+    pub row_index: usize,
+    pub column_index: usize,
+}
+```
+
+```rust
+// crates/database_ui/src/key_bindings.rs
+
+pub fn register_key_bindings(cx: &mut App) {
+    cx.bind_keys([
+        // Panel toggles
+        KeyBinding::new("ctrl-shift-d", ToggleDatabaseExplorer, None),
+        KeyBinding::new("ctrl-shift-b", ToggleValueEditor, None),
+
+        // Query execution (context: QueryEditor)
+        KeyBinding::new("ctrl-enter", ExecuteQuery, Some("QueryEditor")),
+        KeyBinding::new("escape", CancelQuery, Some("QueryEditor && is_executing")),
+        KeyBinding::new("ctrl-shift-e", ExplainQuery, Some("QueryEditor")),
+        KeyBinding::new("ctrl-shift-f", FormatQuery, Some("QueryEditor")),
+
+        // Grid navigation (context: ResultGrid)
+        KeyBinding::new("enter", EditCell, Some("ResultGrid && !is_editing")),
+        KeyBinding::new("f2", EditCell, Some("ResultGrid && !is_editing")),
+        KeyBinding::new("escape", CancelQuery, Some("ResultGrid && is_editing")),
+        KeyBinding::new("delete", SetCellNull, Some("ResultGrid")),
+        KeyBinding::new("ctrl-a", SelectAll, Some("ResultGrid")),
+        KeyBinding::new("ctrl-d", CloneRow, Some("ResultGrid")),
+        KeyBinding::new("ctrl-minus", DeleteSelectedRows, Some("ResultGrid")),
+        KeyBinding::new("ctrl-=", AddRow, Some("ResultGrid")),
+        KeyBinding::new("ctrl-z", UndoDataEdit, Some("ResultGrid")),
+        KeyBinding::new("ctrl-shift-z", RedoDataEdit, Some("ResultGrid")),
+        KeyBinding::new("ctrl-shift-r", ToggleRecordView, Some("ResultGrid")),
+        KeyBinding::new("ctrl-shift-v", ToggleValueEditor, Some("ResultGrid")),
+        KeyBinding::new("ctrl-pagedown", NextPage, Some("ResultGrid")),
+        KeyBinding::new("ctrl-pageup", PreviousPage, Some("ResultGrid")),
+        KeyBinding::new("ctrl-f12", ColumnListSearch, Some("ResultGrid")),
+
+        // Explorer (context: DatabaseExplorer)
+        KeyBinding::new("f5", RefreshExplorer, Some("DatabaseExplorer")),
+        KeyBinding::new("ctrl-f", FilterExplorerObjects, Some("DatabaseExplorer")),
+    ]);
+}
+```
+
+### 0.7 Core data types
+
+**Steps:**
+1. Create `crates/database_core/src/schema.rs`
+2. Define all schema types used across the application
+3. Implement Display, serialization, comparison traits
+
+```rust
+// crates/database_core/src/schema.rs
+
+/// Unique identifier for a connection across the application
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ConnectionId(pub String);
+
+/// Reference to a table or view in a specific schema
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TableRef {
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+    pub name: String,
+}
+
+impl TableRef {
+    pub fn qualified_name(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(catalog) = &self.catalog { parts.push(catalog.as_str()); }
+        if let Some(schema) = &self.schema { parts.push(schema.as_str()); }
+        parts.push(&self.name);
+        parts.join(".")
+    }
+}
+
+/// A database object discovered via introspection
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SchemaObject {
+    pub object_type: SchemaObjectType,
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SchemaObjectType {
+    Database,
+    Schema,
+    Table,
+    View,
+    MaterializedView,
+    Function,
+    Procedure,
+    Sequence,
+    Index,
+    Trigger,
+}
+
+/// Column metadata from introspection
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub data_type: String,          // Raw SQL type string
+    pub normalized_type: DataType,  // Normalized enum for cell rendering
+    pub is_nullable: bool,
+    pub is_primary_key: bool,
+    pub is_foreign_key: bool,
+    pub default_value: Option<String>,
+    pub ordinal_position: usize,
+    pub foreign_key_ref: Option<ForeignKeyRef>,
+}
+
+/// Normalized data types for type-aware rendering and editing
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataType {
+    Boolean,
+    SmallInt,
+    Integer,
+    BigInt,
+    Float,
+    Double,
+    Decimal { precision: Option<u32>, scale: Option<u32> },
+    Varchar { max_length: Option<u32> },
+    Text,
+    Char { length: u32 },
+    Date,
+    Time,
+    Timestamp,
+    TimestampTz,
+    Interval,
+    Uuid,
+    Json,
+    Jsonb,
+    Xml,
+    ByteArray,
+    Blob,
+    Array { element_type: Box<DataType> },
+    Enum { variants: Vec<String> },
+    Point,
+    Geometry,
+    Other(String),
+}
+
+/// A cell value in a query result
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum CellValue {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    Date(chrono::NaiveDate),
+    Time(chrono::NaiveTime),
+    Timestamp(chrono::NaiveDateTime),
+    TimestampTz(chrono::DateTime<chrono::Utc>),
+    Json(serde_json::Value),
+    Uuid(uuid::Uuid),
+    Array(Vec<CellValue>),
+}
+
+impl CellValue {
+    pub fn is_null(&self) -> bool { matches!(self, CellValue::Null) }
+
+    pub fn display_string(&self, settings: &NumberFormatSettings) -> String {
+        match self {
+            CellValue::Null => "NULL".to_string(),
+            CellValue::Boolean(b) => b.to_string(),
+            CellValue::Integer(i) => format_number(*i as f64, settings),
+            CellValue::Float(f) => format_number(*f, settings),
+            CellValue::String(s) => s.clone(),
+            CellValue::Bytes(b) => format!("{} bytes", b.len()),
+            CellValue::Json(v) => serde_json::to_string(v).unwrap_or_default(),
+            // ... other variants
+            _ => format!("{:?}", self),
+        }
+    }
+}
+
+/// Result of a query execution
+#[derive(Clone, Debug)]
+pub struct QueryResult {
+    pub columns: Vec<ColumnInfo>,
+    pub rows: Vec<Vec<CellValue>>,
+    pub rows_affected: Option<u64>,
+    pub execution_time: Duration,
+    pub has_more_rows: bool,         // True if server-side pagination truncated
+    pub total_row_count: Option<u64>, // If known (e.g., from COUNT(*))
+    pub warnings: Vec<String>,
+}
+
+/// Foreign key reference
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForeignKeyRef {
+    pub referenced_table: TableRef,
+    pub referenced_column: String,
+}
+
+/// Foreign key metadata
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForeignKey {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub referenced_table: TableRef,
+    pub referenced_columns: Vec<String>,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ForeignKeyAction { NoAction, Restrict, Cascade, SetNull, SetDefault }
+
+/// Index metadata
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IndexInfo {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub is_unique: bool,
+    pub is_primary: bool,
+    pub index_type: String,         // btree, hash, gin, gist, etc.
+}
+
+/// Execution plan from EXPLAIN
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExplainPlan {
+    pub raw_text: String,
+    pub nodes: Vec<ExplainNode>,
+    pub total_cost: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExplainNode {
+    pub operation: String,
+    pub object: Option<String>,
+    pub estimated_rows: Option<u64>,
+    pub actual_rows: Option<u64>,
+    pub cost: Option<f64>,
+    pub children: Vec<ExplainNode>,
+}
+```
 
 ---
 
@@ -1656,24 +2248,506 @@ Function, Schema, Connection) to `crates/ui/src/components/icon.rs`.
 Implement the core trait and the SQLite driver first (simplest for testing).
 Use `rusqlite` (already a dependency via `sqlez`).
 
-### 1.2 ConnectionManager entity with pooling
+**Steps:**
+1. Create `crates/database_core/src/driver.rs` with trait definitions
+2. Create `crates/database_core/src/drivers/sqlite.rs`
+3. Implement `DatabaseDriver` and `DatabaseConnection` for SQLite
+4. Write integration tests with in-memory SQLite
+5. Implement type mapping from SQLite types to `DataType` enum
 
 ```rust
-pub struct ConnectionManager {
-    connections: Vec<Entity<DatabaseConnectionState>>,
-    active_connection: Option<ConnectionId>,
-    _subscriptions: Vec<Subscription>,
+// crates/database_core/src/driver.rs
+
+/// Identifies a supported database driver
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum DriverType {
+    Sqlite,
+    Postgres,
+    Mysql,
+    Mssql,
+    Duckdb,
+}
+
+impl DriverType {
+    pub fn default_port(&self) -> Option<u16> {
+        match self {
+            Self::Postgres => Some(5432),
+            Self::Mysql => Some(3306),
+            Self::Mssql => Some(1433),
+            _ => None,
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Sqlite => "SQLite",
+            Self::Postgres => "PostgreSQL",
+            Self::Mysql => "MySQL",
+            Self::Mssql => "SQL Server",
+            Self::Duckdb => "DuckDB",
+        }
+    }
+}
+
+#[async_trait]
+pub trait DatabaseDriver: Send + Sync {
+    fn driver_type(&self) -> DriverType;
+    fn supported_types(&self) -> Vec<DataType>;
+
+    /// Connect to the database. The connection owns its resources
+    /// and should be held in an Entity for lifecycle management.
+    async fn connect(&self, config: &ConnectionConfig) -> Result<Box<dyn DatabaseConnection>>;
+
+    /// Validate a config without connecting (check required fields, etc.)
+    fn validate_config(&self, config: &ConnectionConfig) -> Result<()>;
+}
+
+#[async_trait]
+pub trait DatabaseConnection: Send + Sync {
+    // --- Query execution ---
+    async fn execute_query(&self, sql: &str) -> Result<QueryResult>;
+    async fn execute_statement(&self, sql: &str) -> Result<u64>;
+    async fn cancel(&self) -> Result<()>;
+
+    // --- Introspection (3 levels) ---
+    async fn introspect_names(&self) -> Result<Vec<SchemaObject>>;
+    async fn introspect_columns(&self, table: &TableRef) -> Result<Vec<ColumnInfo>>;
+    async fn introspect_ddl(&self, object: &SchemaObject) -> Result<String>;
+
+    // --- Metadata ---
+    async fn foreign_keys(&self, table: &TableRef) -> Result<Vec<ForeignKey>>;
+    async fn indexes(&self, table: &TableRef) -> Result<Vec<IndexInfo>>;
+    async fn explain(&self, sql: &str) -> Result<ExplainPlan>;
+
+    // --- Schema modification ---
+    async fn execute_ddl(&self, sql: &str) -> Result<()>;
+
+    // --- Connection state ---
+    fn is_alive(&self) -> bool;
+    fn server_version(&self) -> Option<String>;
+    fn current_database(&self) -> Option<String>;
+    fn current_schema(&self) -> Option<String>;
+}
+
+/// Registry of available drivers
+pub struct DriverRegistry {
+    drivers: HashMap<DriverType, Arc<dyn DatabaseDriver>>,
+}
+
+impl DriverRegistry {
+    pub fn new() -> Self {
+        let mut registry = Self { drivers: HashMap::new() };
+        registry.register(Arc::new(SqliteDriver));
+        // Other drivers registered in later phases
+        registry
+    }
+
+    pub fn register(&mut self, driver: Arc<dyn DatabaseDriver>) {
+        self.drivers.insert(driver.driver_type(), driver);
+    }
+
+    pub fn get(&self, driver_type: &DriverType) -> Result<Arc<dyn DatabaseDriver>> {
+        self.drivers.get(driver_type)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Driver not found: {:?}", driver_type))
+    }
 }
 ```
 
-Connection pooling with configurable max connections, idle timeout,
-and automatic reconnection with exponential backoff (1s, 2s, 4s, 8s, max 30s).
+```rust
+// crates/database_core/src/drivers/sqlite.rs
+
+pub struct SqliteDriver;
+
+#[async_trait]
+impl DatabaseDriver for SqliteDriver {
+    fn driver_type(&self) -> DriverType { DriverType::Sqlite }
+
+    fn supported_types(&self) -> Vec<DataType> {
+        vec![
+            DataType::Integer, DataType::Float, DataType::Text,
+            DataType::Blob, DataType::Boolean,
+        ]
+    }
+
+    async fn connect(&self, config: &ConnectionConfig) -> Result<Box<dyn DatabaseConnection>> {
+        let path = config.sqlite_path.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SQLite requires a file path"))?;
+        let connection = rusqlite::Connection::open(path)?;
+        Ok(Box::new(SqliteConnection { connection: Mutex::new(connection) }))
+    }
+
+    fn validate_config(&self, config: &ConnectionConfig) -> Result<()> {
+        if config.sqlite_path.is_none() {
+            return Err(anyhow::anyhow!("SQLite path is required"));
+        }
+        Ok(())
+    }
+}
+
+pub struct SqliteConnection {
+    connection: Mutex<rusqlite::Connection>,
+}
+
+#[async_trait]
+impl DatabaseConnection for SqliteConnection {
+    async fn execute_query(&self, sql: &str) -> Result<QueryResult> {
+        let conn = self.connection.lock();
+        let mut stmt = conn.prepare(sql)?;
+        let column_count = stmt.column_count();
+        let columns: Vec<ColumnInfo> = (0..column_count)
+            .map(|i| ColumnInfo {
+                name: stmt.column_name(i).unwrap_or("?").to_string(),
+                data_type: stmt.column_decltype(i)
+                    .unwrap_or_default()
+                    .to_string(),
+                normalized_type: sqlite_type_to_data_type(
+                    stmt.column_decltype(i).unwrap_or_default()
+                ),
+                is_nullable: true,
+                is_primary_key: false,
+                is_foreign_key: false,
+                default_value: None,
+                ordinal_position: i,
+                foreign_key_ref: None,
+            })
+            .collect();
+
+        let started_at = Instant::now();
+        let rows = stmt.query_map([], |row| {
+            let values: Vec<CellValue> = (0..column_count)
+                .map(|i| sqlite_value_to_cell(row, i))
+                .collect();
+            Ok(values)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(QueryResult {
+            columns,
+            rows_affected: None,
+            execution_time: started_at.elapsed(),
+            has_more_rows: false,
+            total_row_count: Some(rows.len() as u64),
+            warnings: vec![],
+            rows,
+        })
+    }
+
+    async fn execute_statement(&self, sql: &str) -> Result<u64> {
+        let conn = self.connection.lock();
+        let affected = conn.execute(sql, [])?;
+        Ok(affected as u64)
+    }
+
+    async fn cancel(&self) -> Result<()> {
+        self.connection.lock().interrupt();
+        Ok(())
+    }
+
+    async fn introspect_names(&self) -> Result<Vec<SchemaObject>> {
+        let conn = self.connection.lock();
+        let mut stmt = conn.prepare(
+            "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name"
+        )?;
+        let objects = stmt.query_map([], |row| {
+            let obj_type: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            Ok(SchemaObject {
+                object_type: match obj_type.as_str() {
+                    "table" => SchemaObjectType::Table,
+                    "view" => SchemaObjectType::View,
+                    _ => SchemaObjectType::Table,
+                },
+                catalog: None,
+                schema: None,
+                name,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok(objects)
+    }
+
+    async fn introspect_columns(&self, table: &TableRef) -> Result<Vec<ColumnInfo>> {
+        let conn = self.connection.lock();
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info('{}')", table.name))?;
+        let columns = stmt.query_map([], |row| {
+            let name: String = row.get(1)?;
+            let type_name: String = row.get(2)?;
+            let not_null: bool = row.get(3)?;
+            let default_value: Option<String> = row.get(4)?;
+            let is_pk: bool = row.get(5)?;
+            Ok(ColumnInfo {
+                ordinal_position: row.get::<_, usize>(0)?,
+                name,
+                data_type: type_name.clone(),
+                normalized_type: sqlite_type_to_data_type(&type_name),
+                is_nullable: !not_null,
+                is_primary_key: is_pk,
+                is_foreign_key: false,
+                default_value,
+                foreign_key_ref: None,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok(columns)
+    }
+
+    async fn introspect_ddl(&self, object: &SchemaObject) -> Result<String> {
+        let conn = self.connection.lock();
+        let sql = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE name = ?",
+            [&object.name],
+            |row| row.get::<_, String>(0),
+        )?;
+        Ok(sql)
+    }
+
+    async fn foreign_keys(&self, table: &TableRef) -> Result<Vec<ForeignKey>> {
+        let conn = self.connection.lock();
+        let mut stmt = conn.prepare(&format!("PRAGMA foreign_key_list('{}')", table.name))?;
+        let fks = stmt.query_map([], |row| {
+            Ok(ForeignKey {
+                name: format!("fk_{}", row.get::<_, usize>(0)?),
+                columns: vec![row.get::<_, String>(3)?],
+                referenced_table: TableRef {
+                    catalog: None,
+                    schema: None,
+                    name: row.get::<_, String>(2)?,
+                },
+                referenced_columns: vec![row.get::<_, String>(4)?],
+                on_update: parse_fk_action(row.get::<_, String>(5)?),
+                on_delete: parse_fk_action(row.get::<_, String>(6)?),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok(fks)
+    }
+
+    async fn indexes(&self, table: &TableRef) -> Result<Vec<IndexInfo>> {
+        let conn = self.connection.lock();
+        let mut stmt = conn.prepare(&format!("PRAGMA index_list('{}')", table.name))?;
+        let indexes = stmt.query_map([], |row| {
+            Ok(IndexInfo {
+                name: row.get::<_, String>(1)?,
+                columns: vec![], // Filled by PRAGMA index_info
+                is_unique: row.get::<_, bool>(2)?,
+                is_primary: row.get::<_, String>(3)? == "pk",
+                index_type: "btree".to_string(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok(indexes)
+    }
+
+    async fn explain(&self, sql: &str) -> Result<ExplainPlan> {
+        let conn = self.connection.lock();
+        let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {}", sql))?;
+        let mut raw_lines = Vec::new();
+        stmt.query_map([], |row| {
+            let detail: String = row.get(3)?;
+            raw_lines.push(detail);
+            Ok(())
+        })?.collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ExplainPlan {
+            raw_text: raw_lines.join("\n"),
+            nodes: vec![], // Parsed in a later step
+            total_cost: None,
+        })
+    }
+
+    async fn execute_ddl(&self, sql: &str) -> Result<()> {
+        let conn = self.connection.lock();
+        conn.execute_batch(sql)?;
+        Ok(())
+    }
+
+    fn is_alive(&self) -> bool { true }
+    fn server_version(&self) -> Option<String> { Some(rusqlite::version().to_string()) }
+    fn current_database(&self) -> Option<String> { Some("main".to_string()) }
+    fn current_schema(&self) -> Option<String> { None }
+}
+
+/// Map SQLite type declarations to normalized DataType
+fn sqlite_type_to_data_type(type_name: &str) -> DataType {
+    let upper = type_name.to_uppercase();
+    match upper.as_str() {
+        "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" => DataType::Integer,
+        "REAL" | "DOUBLE" | "FLOAT" => DataType::Double,
+        "TEXT" | "VARCHAR" | "CHAR" | "CLOB" => DataType::Text,
+        "BLOB" => DataType::Blob,
+        "BOOLEAN" | "BOOL" => DataType::Boolean,
+        "DATE" => DataType::Date,
+        "DATETIME" | "TIMESTAMP" => DataType::Timestamp,
+        "JSON" => DataType::Json,
+        _ => DataType::Other(type_name.to_string()),
+    }
+}
+```
+
+### 1.2 ConnectionManager entity with pooling
+
+**Steps:**
+1. Create `crates/database_core/src/connection_pool.rs`
+2. Define `ConnectionManager` as a GPUI `Entity`
+3. Implement connect/disconnect lifecycle
+4. Implement connection pooling with idle timeout
+5. Emit events on connection state changes
+
+```rust
+// crates/database_core/src/connection_pool.rs
+
+pub struct ConnectionManager {
+    driver_registry: Arc<DriverRegistry>,
+    connections: HashMap<ConnectionId, Entity<DatabaseConnectionState>>,
+    active_connection: Option<ConnectionId>,
+    credential_cache: HashMap<ConnectionId, String>,
+    _subscriptions: Vec<Subscription>,
+}
+
+pub struct DatabaseConnectionState {
+    pub config: ConnectionConfig,
+    pub status: ConnectionStatus,
+    pub connection: Option<Box<dyn DatabaseConnection>>,
+    pub schema_cache: SchemaCache,
+    pub watchdog_task: Option<Task<()>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConnectionStatus {
+    Disconnected,
+    Connecting,
+    Connected { since: Instant, server_version: Option<String> },
+    Reconnecting { attempt: usize, next_retry: Instant },
+    Failed(String),
+}
+
+impl EventEmitter<ConnectionEvent> for ConnectionManager {}
+
+pub enum ConnectionEvent {
+    Connected(ConnectionId),
+    Disconnected(ConnectionId),
+    ConnectionFailed { id: ConnectionId, error: String },
+    SchemaRefreshed(ConnectionId),
+    ActiveConnectionChanged(Option<ConnectionId>),
+}
+
+impl ConnectionManager {
+    pub fn new(driver_registry: Arc<DriverRegistry>, cx: &mut Context<Self>) -> Self {
+        Self {
+            driver_registry,
+            connections: HashMap::new(),
+            active_connection: None,
+            credential_cache: HashMap::new(),
+            _subscriptions: vec![],
+        }
+    }
+
+    /// Connect to a data source. Returns the connection id.
+    pub fn connect(
+        &mut self,
+        config: ConnectionConfig,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ConnectionId>> {
+        let connection_id = ConnectionId(config.id.clone());
+        let driver = self.driver_registry.get(&config.driver);
+
+        cx.spawn({
+            let connection_id = connection_id.clone();
+            async move |this, cx| {
+                let driver = driver?;
+                let connection = driver.connect(&config).await?;
+
+                this.update(cx, |this, cx| {
+                    let state = cx.new(|_| DatabaseConnectionState {
+                        config: config.clone(),
+                        status: ConnectionStatus::Connected {
+                            since: Instant::now(),
+                            server_version: connection.server_version(),
+                        },
+                        connection: Some(connection),
+                        schema_cache: SchemaCache::new(),
+                        watchdog_task: None,
+                    });
+                    this.connections.insert(connection_id.clone(), state);
+                    this.active_connection = Some(connection_id.clone());
+                    cx.emit(ConnectionEvent::Connected(connection_id.clone()));
+                    cx.notify();
+                })?;
+
+                Ok(connection_id)
+            }
+        })
+    }
+
+    /// Disconnect from a data source
+    pub fn disconnect(&mut self, id: &ConnectionId, cx: &mut Context<Self>) {
+        if let Some(state) = self.connections.remove(id) {
+            state.update(cx, |state, _| {
+                state.connection = None;
+                state.status = ConnectionStatus::Disconnected;
+                state.watchdog_task = None;
+            });
+        }
+        if self.active_connection.as_ref() == Some(id) {
+            self.active_connection = self.connections.keys().next().cloned();
+        }
+        cx.emit(ConnectionEvent::Disconnected(id.clone()));
+        cx.notify();
+    }
+
+    /// Get the active connection for executing queries
+    pub fn active_connection(&self) -> Option<&Entity<DatabaseConnectionState>> {
+        self.active_connection.as_ref()
+            .and_then(|id| self.connections.get(id))
+    }
+
+    /// Set active connection
+    pub fn set_active(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        self.active_connection = Some(id.clone());
+        cx.emit(ConnectionEvent::ActiveConnectionChanged(Some(id)));
+        cx.notify();
+    }
+
+    /// Execute a query on a specific connection
+    pub fn execute_query(
+        &self,
+        connection_id: &ConnectionId,
+        sql: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<QueryResult>> {
+        let state = self.connections.get(connection_id).cloned();
+        cx.background_spawn(async move {
+            let state = state.ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
+            // Read connection from state (needs careful borrow management)
+            // Execute query on background thread
+            todo!()
+        })
+    }
+
+    /// List all connections
+    pub fn connections(&self) -> Vec<(ConnectionId, ConnectionStatus)> {
+        self.connections.iter().map(|(id, state)| {
+            // Read status from state
+            (id.clone(), ConnectionStatus::Disconnected) // placeholder
+        }).collect()
+    }
+}
+```
 
 ### 1.3 SSH tunnel support
 
 Use `russh` or `async-ssh2-lite` for SSH tunneling. Configuration:
 
+**Steps:**
+1. Create `crates/database_core/src/ssh_tunnel.rs`
+2. Implement SSH tunnel lifecycle (open, monitor, close)
+3. Support password, private key, and SSH agent auth
+4. Integrate with `ConnectionManager` connect flow
+
 ```rust
+// crates/database_core/src/ssh_tunnel.rs
+
 pub struct SshTunnelConfig {
     pub host: String,
     pub port: u16,
@@ -1681,18 +2755,90 @@ pub struct SshTunnelConfig {
     pub auth: SshAuth,            // Password, PrivateKey, or Agent
     pub local_port: Option<u16>,  // Auto-assign if None
 }
+
+pub enum SshAuth {
+    Password(String),
+    PrivateKey { path: PathBuf, passphrase: Option<String> },
+    Agent,
+}
+
+pub struct SshTunnel {
+    config: SshTunnelConfig,
+    local_port: u16,
+    session: Option<russh::client::Handle<SshHandler>>,
+    monitor_task: Option<Task<()>>,
+}
+
+impl SshTunnel {
+    /// Open the SSH tunnel and return the local port to connect through
+    pub async fn open(config: SshTunnelConfig, remote_host: &str, remote_port: u16) -> Result<Self> {
+        // 1. Connect to SSH server
+        // 2. Authenticate
+        // 3. Open port forwarding (local_port -> remote_host:remote_port)
+        // 4. Start health monitor task
+        todo!()
+    }
+
+    pub fn local_port(&self) -> u16 { self.local_port }
+
+    pub async fn close(&mut self) -> Result<()> {
+        self.monitor_task = None;
+        if let Some(session) = self.session.take() {
+            session.disconnect(russh::Disconnect::ByApplication, "", "en").await?;
+        }
+        Ok(())
+    }
+}
 ```
 
 ### 1.4 SSL/TLS configuration
 
 Certificate management: CA cert, client cert, verify-full vs verify-ca mode.
 
+**Steps:**
+1. Add `SslConfig` to `crates/database_core/src/schema.rs`
+2. Implement TLS connector building per driver
+3. File picker integration in connection dialog for cert paths
+
+```rust
+// Added to crates/database_core/src/schema.rs
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SslConfig {
+    pub mode: SslMode,
+    pub ca_cert_path: Option<PathBuf>,
+    pub client_cert_path: Option<PathBuf>,
+    pub client_key_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub enum SslMode {
+    Disable,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+```
+
 ### 1.5 Connection dialog UI
 
 `Entity<ConnectionDialog>` — modal dialog for configuring a data source:
 host, port, database, user, password, SSL, SSH, test connection button.
 
-**NEW: Color coding per connection** — Each connection can be assigned a color
+**Steps:**
+1. Create `crates/database_ui/src/connection_dialog.rs`
+2. Implement `ModalView` + `EventEmitter<DismissEvent>` + `Focusable` + `Render`
+3. Create form layout with `Entity<Editor>` fields
+4. Implement driver tab switching
+5. Implement test connection flow with spinner
+6. Implement save/cancel actions
+7. Wire to `ConnectionManager::connect()`
+
+(See detailed render layout and entity structure in the
+[UI/Interface Specification — Section 3](#3-connection-dialog).)
+
+**Color coding per connection** — Each connection can be assigned a color
 (red for production, green for dev, blue for staging). This color tints:
 - The Database Explorer header for that connection
 - Query editor tab borders
@@ -1705,11 +2851,126 @@ This prevents accidentally running queries on production.
 
 Tree panel registered as a Zed Panel with `activation_priority: 15`.
 
+**Steps:**
+1. Create `crates/database_ui/src/database_explorer.rs`
+2. Implement `Panel` + `Focusable` + `EventEmitter<PanelEvent>` + `Render`
+3. Implement tree node model (`TreeNode` enum with variants per object type)
+4. Implement tree rendering with `uniform_list` + `ListItem`
+5. Implement expand/collapse with lazy loading via `ConnectionManager`
+6. Implement context menus per node type
+7. Implement drag-and-drop for tables/columns
+8. Implement fuzzy filter
+9. Register panel in `initialize_panels()`
+
+(See detailed entity structure, tree hierarchy, and rendering pattern in the
+[UI/Interface Specification — Section 2](#2-database-explorer-panel).)
+
+```rust
+// crates/database_ui/src/database_explorer.rs
+
+/// Tree node model for the explorer hierarchy
+pub enum TreeNode {
+    Connection {
+        id: ConnectionId,
+        name: String,
+        color_index: usize,
+        status: ConnectionStatus,
+        children: Vec<TreeNode>,
+        is_expanded: bool,
+    },
+    Database {
+        name: String,
+        children: Vec<TreeNode>,
+        is_expanded: bool,
+    },
+    Schema {
+        name: String,
+        children: Vec<TreeNode>,
+        is_expanded: bool,
+    },
+    Category {
+        kind: CategoryKind,
+        children: Vec<TreeNode>,
+        count: usize,
+        is_expanded: bool,
+    },
+    Table {
+        table_ref: TableRef,
+        children: Vec<TreeNode>,  // Columns, loaded on expand
+        is_expanded: bool,
+    },
+    View {
+        table_ref: TableRef,
+        is_expanded: bool,
+    },
+    Function {
+        name: String,
+        signature: Option<String>,
+    },
+    Sequence {
+        name: String,
+    },
+    Column {
+        info: ColumnInfo,
+    },
+    Loading,  // Placeholder while loading children
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CategoryKind { Tables, Views, Functions, Sequences }
+
+impl TreeNode {
+    pub fn id(&self) -> ElementId { /* unique ID from path */ todo!() }
+    pub fn depth(&self) -> usize { /* computed from parent chain */ todo!() }
+    pub fn has_children(&self) -> bool { /* depends on variant */ todo!() }
+    pub fn is_expanded(&self) -> bool { /* depends on variant */ todo!() }
+    pub fn icon_name(&self) -> IconName { /* per variant */ todo!() }
+    pub fn icon_color(&self) -> Color { /* per variant */ todo!() }
+    pub fn display_name(&self) -> SharedString { /* per variant */ todo!() }
+    pub fn connection_color(&self) -> Option<Hsla> { /* from connection ancestor */ todo!() }
+}
+
+impl Panel for DatabaseExplorer {
+    fn persistent_name() -> &'static str { "DatabaseExplorer" }
+    fn panel_key() -> &'static str { "DatabaseExplorer" }
+    fn position(&self, _window: &Window, _cx: &App) -> DockPosition { self.position }
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        matches!(position, DockPosition::Left | DockPosition::Right)
+    }
+    fn set_position(&mut self, position: DockPosition, _window: &mut Window, cx: &mut Context<Self>) {
+        self.position = position;
+        cx.notify();
+    }
+    fn size(&self, _window: &Window, _cx: &App) -> Pixels { self.width.unwrap_or(px(260.)) }
+    fn set_size(&mut self, size: Option<Pixels>, _window: &mut Window, cx: &mut Context<Self>) {
+        self.width = size;
+        cx.notify();
+    }
+    fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
+        Some(IconName::DatabaseZap)
+    }
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+        Some("Database Explorer")
+    }
+    fn toggle_action(&self) -> Box<dyn Action> {
+        Box::new(ToggleDatabaseExplorer)
+    }
+    fn activation_priority(&self) -> u32 { 15 }
+    fn starts_open(&self, _window: &Window, _cx: &App) -> bool { false }
+}
+
+impl Focusable for DatabaseExplorer {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle { self.focus_handle.clone() }
+}
+
+impl EventEmitter<PanelEvent> for DatabaseExplorer {}
+```
+
 Features:
 - Hierarchical tree: Data Source > Database > Schema > Tables/Views/Functions/Sequences
 - Each node shows icon + name + object count badge
 - Double-click table opens data grid; double-click view opens DDL
-- **NEW: Object filtering by pattern** — Right-click a schema node >
+- **Object filtering by pattern** — Right-click a schema node >
   "Filter Objects" > enter regex (e.g., `^(?!_tmp).*`) to hide matching objects
 
 ### 1.7 Introspection by levels with cache
@@ -1721,19 +2982,156 @@ Features:
 Smart refresh: after DDL execution, only re-introspect affected objects.
 Schema cache stored in-memory with `Arc<RwLock<SchemaCache>>`.
 
+**Steps:**
+1. Create `crates/database_core/src/introspection.rs`
+2. Implement `SchemaCache` with TTL and invalidation
+3. Implement progressive loading (Level 1 on connect, Level 2 on expand)
+4. Implement smart refresh (invalidate only changed objects after DDL)
+
+```rust
+// crates/database_core/src/introspection.rs
+
+pub struct SchemaCache {
+    /// Level 1: Object names
+    objects: HashMap<String, Vec<SchemaObject>>,  // schema_name -> objects
+    /// Level 2: Column metadata per table
+    columns: HashMap<TableRef, Vec<ColumnInfo>>,
+    /// Level 3: DDL source
+    ddl: HashMap<SchemaObject, String>,
+    /// Timestamps for cache invalidation
+    last_refreshed: HashMap<String, Instant>,
+    /// TTL for cache entries
+    ttl: Duration,
+}
+
+impl SchemaCache {
+    pub fn new() -> Self {
+        Self {
+            objects: HashMap::new(),
+            columns: HashMap::new(),
+            ddl: HashMap::new(),
+            last_refreshed: HashMap::new(),
+            ttl: Duration::from_secs(300), // 5 min default
+        }
+    }
+
+    pub fn get_objects(&self, schema: &str) -> Option<&Vec<SchemaObject>> {
+        if self.is_stale(schema) { return None; }
+        self.objects.get(schema)
+    }
+
+    pub fn get_columns(&self, table: &TableRef) -> Option<&Vec<ColumnInfo>> {
+        self.columns.get(table)
+    }
+
+    pub fn get_ddl(&self, object: &SchemaObject) -> Option<&String> {
+        self.ddl.get(object)
+    }
+
+    pub fn set_objects(&mut self, schema: String, objects: Vec<SchemaObject>) {
+        self.last_refreshed.insert(schema.clone(), Instant::now());
+        self.objects.insert(schema, objects);
+    }
+
+    pub fn set_columns(&mut self, table: TableRef, columns: Vec<ColumnInfo>) {
+        self.columns.insert(table, columns);
+    }
+
+    /// Invalidate a specific object (after DDL execution)
+    pub fn invalidate(&mut self, object: &SchemaObject) {
+        let table_ref = TableRef {
+            catalog: object.catalog.clone(),
+            schema: object.schema.clone(),
+            name: object.name.clone(),
+        };
+        self.columns.remove(&table_ref);
+        self.ddl.remove(object);
+        // Don't remove from objects — will be refreshed on next access
+        if let Some(schema) = &object.schema {
+            self.last_refreshed.remove(schema);
+        }
+    }
+
+    /// Invalidate all cache for a schema
+    pub fn invalidate_schema(&mut self, schema: &str) {
+        self.objects.remove(schema);
+        self.last_refreshed.remove(schema);
+        self.columns.retain(|table_ref, _| table_ref.schema.as_deref() != Some(schema));
+    }
+
+    fn is_stale(&self, schema: &str) -> bool {
+        self.last_refreshed.get(schema)
+            .map_or(true, |t| t.elapsed() > self.ttl)
+    }
+}
+```
+
 ### 1.8 Workspace serialization
 
 Persist panel state across Zed restarts using KVP store (same pattern as
-ProjectPanel):
+ProjectPanel).
+
+**Steps:**
+1. Define `SerializedDatabasePanel` with all state to persist
+2. Implement `SerializableItem` (if using Item) or custom KVP serialization
+3. Save on panel close / workspace deactivate
+4. Restore on workspace open
 
 ```rust
+// crates/database_ui/src/database_explorer.rs (serialization section)
+
 #[derive(Serialize, Deserialize)]
 struct SerializedDatabasePanel {
     width: Option<f32>,
+    position: DockPosition,
     active_connection_id: Option<String>,
-    expanded_nodes: Vec<SchemaObjectPath>,
+    expanded_nodes: Vec<String>,         // Serialized paths like "conn/db/schema/table"
     open_query_tabs: Vec<SerializedQueryTab>,
     pinned_result_tabs: Vec<SerializedResultTab>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializedQueryTab {
+    connection_id: String,
+    schema: Option<String>,
+    sql_content: String,
+    tab_name: Option<String>,
+    split_ratio: f32,
+    is_pinned: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializedResultTab {
+    connection_id: String,
+    sql: String,
+    tab_name: String,
+}
+
+impl DatabaseExplorer {
+    fn serialize(&self, cx: &App) -> SerializedDatabasePanel {
+        SerializedDatabasePanel {
+            width: self.width.map(|px| px.0),
+            position: self.position,
+            active_connection_id: self.active_connection_id().map(|id| id.0.clone()),
+            expanded_nodes: self.collect_expanded_paths(),
+            open_query_tabs: vec![], // Collected from workspace pane items
+            pinned_result_tabs: vec![],
+        }
+    }
+
+    fn deserialize(
+        serialized: SerializedDatabasePanel,
+        connection_manager: Entity<ConnectionManager>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut explorer = Self::new(connection_manager, window, cx);
+        explorer.width = serialized.width.map(px);
+        explorer.position = serialized.position;
+        // Restore expanded state after connections are re-established
+        explorer.pending_restore = Some(serialized);
+        explorer
+    }
 }
 ```
 
@@ -1743,10 +3141,113 @@ struct SerializedDatabasePanel {
 On connection loss: notify user, retry with exponential backoff,
 preserve pending changes if in a transaction.
 
+**Steps:**
+1. Create watchdog task in `DatabaseConnectionState`
+2. Implement health check (ping) per driver
+3. Implement exponential backoff (1s, 2s, 4s, 8s, max 30s)
+4. Emit `ConnectionEvent::ConnectionFailed` / `ConnectionEvent::Connected` on state changes
+
+```rust
+// crates/database_core/src/connection_pool.rs (watchdog section)
+
+impl DatabaseConnectionState {
+    /// Start a watchdog task that monitors connection health
+    fn start_watchdog(&mut self, cx: &mut Context<Self>) {
+        self.watchdog_task = Some(cx.spawn(async move |this, cx| {
+            let ping_interval = Duration::from_secs(30);
+            let mut backoff = ExponentialBackoff::new(
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+                2.0,
+            );
+
+            loop {
+                cx.background_executor().timer(ping_interval).await;
+
+                let is_alive = this.update(cx, |state, _| {
+                    state.connection.as_ref().map_or(false, |c| c.is_alive())
+                }).unwrap_or(false);
+
+                if !is_alive {
+                    // Try to reconnect with exponential backoff
+                    loop {
+                        let delay = backoff.next_delay();
+                        cx.background_executor().timer(delay).await;
+
+                        match this.update(cx, |state, cx| {
+                            state.attempt_reconnect(cx)
+                        }) {
+                            Ok(task) => match task.await {
+                                Ok(()) => {
+                                    backoff.reset();
+                                    break; // Successfully reconnected
+                                }
+                                Err(_) => continue, // Retry
+                            },
+                            Err(_) => return, // Entity dropped
+                        }
+                    }
+                }
+            }
+        }));
+    }
+}
+
+pub struct ExponentialBackoff {
+    initial: Duration,
+    max: Duration,
+    factor: f64,
+    current: Duration,
+}
+
+impl ExponentialBackoff {
+    pub fn new(initial: Duration, max: Duration, factor: f64) -> Self {
+        Self { initial, max, factor, current: initial }
+    }
+
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = self.current;
+        self.current = Duration::from_secs_f64(
+            (self.current.as_secs_f64() * self.factor).min(self.max.as_secs_f64())
+        );
+        delay
+    }
+
+    pub fn reset(&mut self) { self.current = self.initial; }
+}
+```
+
 ### 1.10 Read-only mode per connection
 
 Toggle per data source that prevents any INSERT/UPDATE/DELETE/DDL.
 Visual indicator in the connection's color bar.
+
+**Steps:**
+1. Add `read_only: bool` to `ConnectionConfig` (already in 0.1)
+2. Implement write guard in `ConnectionManager::execute_statement()`
+3. Add lock icon to explorer node, tab, and status bar when read-only
+4. Allow toggling via connection context menu
+
+```rust
+// In ConnectionManager
+pub fn execute_statement(
+    &self,
+    connection_id: &ConnectionId,
+    sql: String,
+    cx: &mut Context<Self>,
+) -> Task<Result<u64>> {
+    let state = self.connections.get(connection_id).cloned();
+    cx.background_spawn(async move {
+        let state = state.ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
+        // Check read-only guard
+        if state.read(cx).config.read_only {
+            return Err(DatabaseError::ReadOnlyConnection.into());
+        }
+        // Execute on background thread
+        todo!()
+    })
+}
+```
 
 ---
 
@@ -1757,31 +3258,653 @@ Visual indicator in the connection's color bar.
 Specialized buffer with SQL language activated, bound to a connection/schema.
 Uses Zed's standard editor infrastructure (multicursor, vim mode, etc.).
 
+**Steps:**
+1. Create `crates/database_ui/src/query_editor.rs`
+2. Implement `Item` + `Focusable` + `EventEmitter<QueryEditorEvent>` + `Render`
+3. Wrap `Entity<Editor>` with SQL language mode
+4. Implement vertical split layout with ResultGrid
+5. Implement `-- @name` comment parsing for tab naming
+6. Register toolbar items
+
+(See detailed entity structure and render implementation in the
+[UI/Interface Specification — Section 4](#4-query-editor-workspace-item).)
+
+```rust
+// crates/database_ui/src/query_editor.rs
+
+pub struct QueryEditor {
+    editor: Entity<Editor>,
+    connection_manager: Entity<ConnectionManager>,
+    connection_id: Option<ConnectionId>,
+    schema: Option<String>,
+    result_grid: Option<Entity<ResultGrid>>,
+    split_state: Entity<SplitState>,
+    execution_state: ExecutionState,
+    execution_task: Option<Task<()>>,
+    tab_name: Option<String>,
+    query_counter: usize,           // For auto-naming "Query N"
+    focus_handle: FocusHandle,
+    _subscriptions: Vec<Subscription>,
+}
+
+pub enum QueryEditorEvent {
+    ExecutionStarted,
+    ExecutionCompleted { duration: Duration, row_count: usize },
+    ExecutionFailed(DatabaseError),
+    ConnectionChanged(Option<ConnectionId>),
+    Edited,
+}
+
+impl EventEmitter<QueryEditorEvent> for QueryEditor {}
+
+impl QueryEditor {
+    pub fn new(
+        connection_manager: Entity<ConnectionManager>,
+        connection_id: Option<ConnectionId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            // Set SQL language via language registry
+            // editor.set_language(sql_language, cx);
+            editor
+        });
+
+        let split_state = cx.new(|_| SplitState {
+            ratio: 0.5,
+            visible_ratio: 0.5,
+            cached_height: px(0.),
+            is_dragging: false,
+        });
+
+        let _subscriptions = vec![
+            cx.subscribe(&editor, Self::on_editor_event),
+        ];
+
+        Self {
+            editor,
+            connection_manager,
+            connection_id,
+            schema: None,
+            result_grid: None,
+            split_state,
+            execution_state: ExecutionState::Idle,
+            execution_task: None,
+            tab_name: None,
+            query_counter: 0,
+            focus_handle: cx.focus_handle(),
+            _subscriptions,
+        }
+    }
+
+    /// Execute the current query (or selected text if any)
+    pub fn execute(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let connection_id = match &self.connection_id {
+            Some(id) => id.clone(),
+            None => {
+                // Show connection picker
+                return;
+            }
+        };
+
+        let sql = self.get_sql_to_execute(cx);
+        if sql.trim().is_empty() { return; }
+
+        self.execution_state = ExecutionState::Executing {
+            task: Task::ready(()),
+            started_at: Instant::now(),
+        };
+        cx.emit(QueryEditorEvent::ExecutionStarted);
+        cx.notify();
+
+        let connection_manager = self.connection_manager.clone();
+        self.execution_task = Some(cx.spawn({
+            let connection_id = connection_id.clone();
+            async move |this, cx| {
+                let result = connection_manager.update(cx, |manager, cx| {
+                    manager.execute_query(&connection_id, sql.clone(), cx)
+                })?.await;
+
+                this.update(cx, |this, cx| {
+                    match result {
+                        Ok(query_result) => {
+                            this.execution_state = ExecutionState::Completed {
+                                duration: query_result.execution_time,
+                                row_count: query_result.rows.len(),
+                            };
+
+                            // Create or update the result grid
+                            if let Some(grid) = &this.result_grid {
+                                grid.update(cx, |grid, cx| {
+                                    grid.set_data(query_result, cx);
+                                });
+                            } else {
+                                let grid = cx.new(|cx| {
+                                    ResultGrid::new(query_result, cx)
+                                });
+                                this.result_grid = Some(grid);
+                            }
+
+                            cx.emit(QueryEditorEvent::ExecutionCompleted {
+                                duration: query_result.execution_time,
+                                row_count: query_result.rows.len(),
+                            });
+
+                            // Save to query history
+                            this.save_to_history(&sql, &query_result, cx);
+                        }
+                        Err(error) => {
+                            let db_error = DatabaseError::from(error);
+                            this.execution_state = ExecutionState::Failed {
+                                error: db_error.clone(),
+                                duration: Duration::default(),
+                            };
+                            cx.emit(QueryEditorEvent::ExecutionFailed(db_error));
+                        }
+                    }
+                    cx.notify();
+                }).log_err();
+            }
+        }));
+    }
+
+    /// Cancel running query
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        self.execution_task = None;
+        // Also send cancel to the server via ConnectionManager
+        if let Some(connection_id) = &self.connection_id {
+            // connection_manager.cancel_query(connection_id, cx);
+        }
+        self.execution_state = ExecutionState::Idle;
+        cx.notify();
+    }
+
+    /// Get the SQL to execute: selected text if any, otherwise full buffer
+    fn get_sql_to_execute(&self, cx: &App) -> String {
+        let editor = self.editor.read(cx);
+        let selections = editor.selections.all::<usize>(cx);
+        if selections.len() == 1 && !selections[0].is_empty() {
+            let range = selections[0].range();
+            editor.text_for_range(range, cx).collect::<String>()
+        } else {
+            editor.text(cx).to_string()
+        }
+    }
+
+    /// Parse `-- @name MyQuery` from first 5 lines
+    fn parse_tab_name(&self, cx: &App) -> Option<String> {
+        let text = self.editor.read(cx).text(cx);
+        let prefix = "-- @name ";
+        for line in text.lines().take(5) {
+            let trimmed = line.trim();
+            if let Some(name) = trimmed.strip_prefix(prefix) {
+                return Some(name.trim().to_string());
+            }
+        }
+        None
+    }
+
+    fn tab_name(&self, cx: &App) -> SharedString {
+        if let Some(name) = self.parse_tab_name(cx) {
+            return name.into();
+        }
+        if let Some(name) = &self.tab_name {
+            return name.clone().into();
+        }
+        format!("Query {}", self.query_counter).into()
+    }
+
+    fn connection_color(&self, cx: &App) -> Option<Hsla> {
+        self.connection_id.as_ref().and_then(|id| {
+            self.connection_manager.read(cx)
+                .connection_config(id)
+                .map(|config| CONNECTION_COLORS[config.color_index % CONNECTION_COLORS.len()])
+        })
+    }
+
+    fn on_editor_event(
+        &mut self,
+        _editor: &Entity<Editor>,
+        event: &EditorEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            EditorEvent::Edited { .. } => {
+                cx.emit(QueryEditorEvent::Edited);
+            }
+            _ => {}
+        }
+    }
+
+    fn save_to_history(&self, sql: &str, result: &QueryResult, cx: &mut Context<Self>) {
+        // Save to QueryHistory via KVP store
+        todo!()
+    }
+}
+
+// Item trait implementation: see UI Specification Section 4 for full details
+```
+
 ### 2.2 SQL LSP integration
 
 Integrate an SQL Language Server (`sqls` or `sql-language-server`) with
 injected schema metadata for accurate completion.
 
+**Steps:**
+1. Add SQL language definition to Zed's language registry
+2. Configure `sqls` or similar LSP for SQL completion
+3. Inject schema metadata (table/column names) into LSP config
+4. Wire connection switching to LSP config update
+
 Features: completion, formatting, diagnostics (syntax errors, unknown tables).
+
+```rust
+// crates/database_ui/src/sql_language.rs
+
+/// Configure SQL LSP with schema metadata from active connection
+pub fn configure_sql_lsp(
+    connection_id: &ConnectionId,
+    schema_cache: &SchemaCache,
+    cx: &mut App,
+) -> LspAdapterConfig {
+    // Build sqls configuration with connection and schema info
+    // See: https://github.com/sqls-server/sqls
+    let tables = schema_cache.all_tables()
+        .map(|t| serde_json::json!({
+            "name": t.name,
+            "columns": schema_cache.get_columns(&t.to_table_ref())
+                .unwrap_or(&vec![])
+                .iter()
+                .map(|c| serde_json::json!({
+                    "columnName": c.name,
+                    "dataType": c.data_type,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .collect::<Vec<_>>();
+
+    // Return LSP adapter config
+    todo!()
+}
+```
 
 ### 2.3 Query execution (background_spawn)
 
 Execute queries on `cx.background_spawn()`. Return results via channel to
 foreground for UI update.
 
+**Steps:**
+1. Execute SQL on background thread via `cx.background_spawn()`
+2. Stream results row-by-row for large result sets
+3. Update foreground UI progressively
+4. Handle cancellation via `Task` drop
+
+```rust
+// In ConnectionManager
+pub fn execute_query_streaming(
+    &self,
+    connection_id: &ConnectionId,
+    sql: String,
+    page_size: usize,
+    cx: &mut Context<Self>,
+) -> Task<Result<QueryResult>> {
+    let connection = self.get_connection(connection_id);
+
+    cx.background_spawn(async move {
+        let connection = connection?;
+
+        // Add LIMIT/OFFSET for pagination
+        let paginated_sql = if !sql.to_uppercase().contains("LIMIT") {
+            format!("{} LIMIT {}", sql.trim_end_matches(';'), page_size)
+        } else {
+            sql
+        };
+
+        connection.execute_query(&paginated_sql).await
+    })
+}
+```
+
 ### 2.4 Results in extended DataTable
 
-Build on existing `crates/ui/src/components/data_table.rs` with:
-- Type-aware cell rendering (numbers right-aligned, strings left-aligned)
-- Color-coded pending changes (green=insert, yellow=update, red=delete)
-- Configurable page size with paging control at bottom
+Build on existing `crates/ui/src/components/data_table.rs`.
+
+**Steps:**
+1. Create `crates/database_ui/src/result_grid.rs`
+2. Implement `Render` + `Focusable` + `EventEmitter<ResultGridEvent>`
+3. Build on `Table::new().uniform_list().interactable().resizable_columns()`
+4. Implement type-aware cell rendering (see UI Spec Section 5)
+5. Implement selection model (`GridSelection` enum)
+6. Implement inline editing flow
+7. Implement pending changes tracking with color coding
+
+(See detailed entity structure, rendering, and interaction model in the
+[UI/Interface Specification — Section 5](#5-result-grid).)
+
+```rust
+// crates/database_ui/src/result_grid.rs
+
+pub struct ResultGrid {
+    columns: Vec<ColumnDef>,
+    rows: Arc<Vec<Vec<CellValue>>>,
+    total_row_count: Option<usize>,
+    page: usize,
+    page_size: usize,
+    sort_state: Vec<SortColumn>,
+    filters: Vec<ColumnFilter>,
+    selection: GridSelection,
+    pending_edits: IndexMap<CellAddress, PendingEdit>,
+    edit_history: DataEditHistory,
+    view_mode: ViewMode,
+    inline_editor: Option<Entity<Editor>>,
+    editing_cell: Option<(usize, usize)>,
+    table_interaction_state: Entity<TableInteractionState>,
+    column_widths: Entity<TableColumnWidths>,
+    connection_color: Option<Hsla>,
+    focus_handle: FocusHandle,
+    _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ColumnDef {
+    pub info: ColumnInfo,
+    pub visible: bool,
+    pub display_format: Option<DisplayFormat>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SortColumn {
+    pub column_index: usize,
+    pub direction: SortDirection,
+    pub priority: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SortDirection { Ascending, Descending }
+
+#[derive(Clone, Debug)]
+pub struct ColumnFilter {
+    pub column_index: usize,
+    pub filter_type: FilterType,
+    pub value: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum FilterType {
+    Contains,
+    Equals,
+    StartsWith,
+    Regex,
+    IsNull,
+    IsNotNull,
+    GreaterThan,
+    LessThan,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct CellAddress {
+    pub row: usize,
+    pub col: usize,
+}
+
+pub struct PendingEdit {
+    pub original: CellValue,
+    pub current: CellValue,
+    pub kind: EditKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum EditKind { Insert, Update, Delete }
+
+impl EditKind {
+    pub fn indicator_color(&self) -> Hsla {
+        match self {
+            EditKind::Insert => hsla(0.33, 0.7, 0.5, 1.0),  // Green
+            EditKind::Update => hsla(0.14, 0.7, 0.5, 1.0),  // Yellow
+            EditKind::Delete => hsla(0.0, 0.7, 0.5, 1.0),   // Red
+        }
+    }
+
+    pub fn background_color(&self) -> Hsla {
+        match self {
+            EditKind::Insert => hsla(0.33, 0.3, 0.5, 0.12),
+            EditKind::Update => hsla(0.14, 0.3, 0.5, 0.12),
+            EditKind::Delete => hsla(0.0, 0.3, 0.5, 0.12),
+        }
+    }
+}
+
+pub enum ResultGridEvent {
+    SelectionChanged(GridSelection),
+    CellEdited { address: CellAddress, value: CellValue },
+    PendingChangesUpdated { count: usize },
+    CommitRequested,
+    PageChanged(usize),
+}
+
+impl EventEmitter<ResultGridEvent> for ResultGrid {}
+
+impl ResultGrid {
+    pub fn new(query_result: QueryResult, cx: &mut Context<Self>) -> Self {
+        let columns = query_result.columns.iter().map(|c| ColumnDef {
+            info: c.clone(),
+            visible: true,
+            display_format: None,
+        }).collect();
+
+        Self {
+            columns,
+            rows: Arc::new(query_result.rows),
+            total_row_count: query_result.total_row_count.map(|n| n as usize),
+            page: 0,
+            page_size: 500,
+            sort_state: vec![],
+            filters: vec![],
+            selection: GridSelection::None,
+            pending_edits: IndexMap::new(),
+            edit_history: DataEditHistory::new(),
+            view_mode: ViewMode::Grid,
+            inline_editor: None,
+            editing_cell: None,
+            table_interaction_state: cx.new(|cx| TableInteractionState::new(cx)),
+            column_widths: cx.new(|_| TableColumnWidths::default()),
+            connection_color: None,
+            focus_handle: cx.focus_handle(),
+            _subscriptions: vec![],
+        }
+    }
+
+    pub fn set_data(&mut self, query_result: QueryResult, cx: &mut Context<Self>) {
+        self.columns = query_result.columns.iter().map(|c| ColumnDef {
+            info: c.clone(),
+            visible: true,
+            display_format: None,
+        }).collect();
+        self.rows = Arc::new(query_result.rows);
+        self.total_row_count = query_result.total_row_count.map(|n| n as usize);
+        self.selection = GridSelection::None;
+        self.pending_edits.clear();
+        self.edit_history = DataEditHistory::new();
+        cx.notify();
+    }
+
+    /// Start inline editing a cell
+    pub fn start_editing(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let value = &self.rows[row][col];
+        let text = value.display_string(&NumberFormatSettings::default());
+
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(&text, window, cx);
+            editor.select_all(&Default::default(), window, cx);
+            editor
+        });
+
+        self.inline_editor = Some(editor);
+        self.editing_cell = Some((row, col));
+        cx.notify();
+    }
+
+    /// Commit inline edit
+    pub fn commit_edit(&mut self, cx: &mut Context<Self>) {
+        if let (Some((row, col)), Some(editor)) = (self.editing_cell, &self.inline_editor) {
+            let text = editor.read(cx).text(cx).to_string();
+            let new_value = self.parse_cell_value(&text, &self.columns[col].info);
+            let original = self.rows[row][col].clone();
+
+            if new_value != original {
+                let operation = DataOperation::UpdateCell {
+                    row, col,
+                    old_value: original.clone(),
+                    new_value: new_value.clone(),
+                };
+                self.edit_history.push(operation);
+                self.pending_edits.insert(
+                    CellAddress { row, col },
+                    PendingEdit {
+                        original,
+                        current: new_value,
+                        kind: EditKind::Update,
+                    },
+                );
+                cx.emit(ResultGridEvent::PendingChangesUpdated {
+                    count: self.pending_edits.len(),
+                });
+            }
+        }
+        self.inline_editor = None;
+        self.editing_cell = None;
+        cx.notify();
+    }
+
+    /// Cancel inline edit
+    pub fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        self.inline_editor = None;
+        self.editing_cell = None;
+        cx.notify();
+    }
+
+    /// Toggle sort on a column
+    pub fn toggle_sort(&mut self, column_index: usize, multi: bool, cx: &mut Context<Self>) {
+        if !multi {
+            // Single column sort: cycle None -> ASC -> DESC -> None
+            if let Some(existing) = self.sort_state.iter().position(|s| s.column_index == column_index) {
+                match self.sort_state[existing].direction {
+                    SortDirection::Ascending => {
+                        self.sort_state[existing].direction = SortDirection::Descending;
+                    }
+                    SortDirection::Descending => {
+                        self.sort_state.remove(existing);
+                    }
+                }
+            } else {
+                self.sort_state = vec![SortColumn {
+                    column_index,
+                    direction: SortDirection::Ascending,
+                    priority: 1,
+                }];
+            }
+        } else {
+            // Multi-column: add to stack
+            let priority = self.sort_state.len() + 1;
+            if let Some(existing) = self.sort_state.iter().position(|s| s.column_index == column_index) {
+                self.sort_state.remove(existing);
+            } else {
+                self.sort_state.push(SortColumn {
+                    column_index,
+                    direction: SortDirection::Ascending,
+                    priority,
+                });
+            }
+        }
+        // Re-sort rows (client-side) or re-execute query (server-side)
+        cx.notify();
+    }
+
+    /// Generate SQL DML for all pending changes
+    pub fn generate_dml(&self, table_ref: &TableRef) -> Vec<String> {
+        let mut statements = Vec::new();
+        for (address, edit) in &self.pending_edits {
+            match edit.kind {
+                EditKind::Insert => {
+                    // Generate INSERT statement
+                    let columns: Vec<&str> = self.columns.iter()
+                        .map(|c| c.info.name.as_str())
+                        .collect();
+                    let values: Vec<String> = self.rows[address.row].iter()
+                        .map(|v| v.to_sql_literal())
+                        .collect();
+                    statements.push(format!(
+                        "INSERT INTO {} ({}) VALUES ({})",
+                        table_ref.qualified_name(),
+                        columns.join(", "),
+                        values.join(", "),
+                    ));
+                }
+                EditKind::Update => {
+                    // Generate UPDATE with WHERE on primary key
+                    let pk_columns = self.primary_key_where_clause(address.row);
+                    statements.push(format!(
+                        "UPDATE {} SET {} = {} WHERE {}",
+                        table_ref.qualified_name(),
+                        self.columns[address.col].info.name,
+                        edit.current.to_sql_literal(),
+                        pk_columns,
+                    ));
+                }
+                EditKind::Delete => {
+                    let pk_columns = self.primary_key_where_clause(address.row);
+                    statements.push(format!(
+                        "DELETE FROM {} WHERE {}",
+                        table_ref.qualified_name(),
+                        pk_columns,
+                    ));
+                }
+            }
+        }
+        statements
+    }
+
+    fn primary_key_where_clause(&self, row: usize) -> String {
+        self.columns.iter().enumerate()
+            .filter(|(_, c)| c.info.is_primary_key)
+            .map(|(i, c)| format!("{} = {}", c.info.name, self.rows[row][i].to_sql_literal()))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
+
+    fn parse_cell_value(&self, text: &str, column: &ColumnInfo) -> CellValue {
+        if text.eq_ignore_ascii_case("null") {
+            return CellValue::Null;
+        }
+        match &column.normalized_type {
+            DataType::Boolean => CellValue::Boolean(text.eq_ignore_ascii_case("true")),
+            DataType::Integer | DataType::BigInt | DataType::SmallInt => {
+                text.parse::<i64>().map(CellValue::Integer).unwrap_or(CellValue::String(text.to_string()))
+            }
+            DataType::Float | DataType::Double => {
+                text.parse::<f64>().map(CellValue::Float).unwrap_or(CellValue::String(text.to_string()))
+            }
+            _ => CellValue::String(text.to_string()),
+        }
+    }
+}
+```
 
 ### 2.5 Multi-tab results + tab pinning
 
 Each query execution opens a result tab. Tabs can be pinned to prevent
 replacement.
 
-**NEW: Tab naming via SQL comments** — A comment like `-- @name Monthly Sales`
+**Steps:**
+1. Implement result tab creation in `QueryEditor::execute()`
+2. Non-pinned result tabs are replaced by default on re-execution
+3. Pinned tabs create a new result tab on re-execution
+4. Tab naming via `-- @name Monthly Sales` SQL comments
+
+**Tab naming via SQL comments** — A comment like `-- @name Monthly Sales`
 above a query names the result tab "Monthly Sales" instead of the default.
 The prefix keyword (`@name`) is configurable in `DatabaseSettings.tab_naming_prefix`.
 
@@ -1790,46 +3913,298 @@ The prefix keyword (`@name`) is configurable in `DatabaseSettings.tab_naming_pre
 Display results directly below the query in the SQL buffer (like DataGrip's
 in-editor results mode). Full-width grid that adjusts to editor width.
 
-**NEW: Independent split data grids** — When the editor is split, each split
+**Steps:**
+1. Implement vertical split in `QueryEditor::render()` (see UI Spec Section 4)
+2. Implement draggable split handle with ratio state
+3. Implement independent grid instances per split
+
+**Independent split data grids** — When the editor is split, each split
 gets its own independent data grid instance with separate filter/sort state.
 This is managed by giving each split its own `Entity<ResultGrid>`.
+
+```rust
+impl Item for QueryEditor {
+    fn can_split(&self) -> bool { true }
+
+    fn clone_on_split(
+        &self,
+        _workspace_id: Option<WorkspaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<Entity<Self>>> {
+        let editor_clone = self.editor.update(cx, |editor, cx| {
+            editor.clone_on_split(None, window, cx)
+        });
+        let connection_manager = self.connection_manager.clone();
+        let connection_id = self.connection_id.clone();
+
+        Task::ready(Some(cx.new(|cx| {
+            let mut cloned = QueryEditor::new(connection_manager, connection_id, window, cx);
+            // Clone gets its own independent ResultGrid (not shared)
+            cloned
+        })))
+    }
+}
+```
 
 ### 2.7 Query history per connection
 
 Save all executed queries with timestamp, duration, row count, and error status.
-Stored in the `db` crate's KVP store, scoped by connection ID.
-Searchable via a history panel.
+
+**Steps:**
+1. Create `crates/database_core/src/history.rs`
+2. Define `QueryHistoryEntry` struct
+3. Store in `db` crate's KVP store, scoped by connection ID
+4. Implement searchable history panel (optional, can be a `ModalView`)
+
+```rust
+// crates/database_core/src/history.rs
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueryHistoryEntry {
+    pub id: usize,
+    pub connection_id: ConnectionId,
+    pub sql: String,
+    pub executed_at: chrono::DateTime<chrono::Utc>,
+    pub duration: Duration,
+    pub row_count: Option<usize>,
+    pub error: Option<String>,
+    pub schema: Option<String>,
+}
+
+pub struct QueryHistory {
+    entries: Vec<QueryHistoryEntry>,
+    max_entries: usize,
+    next_id: usize,
+}
+
+impl QueryHistory {
+    pub fn new(max_entries: usize) -> Self {
+        Self { entries: Vec::new(), max_entries, next_id: 0 }
+    }
+
+    pub fn add(&mut self, entry: QueryHistoryEntry) {
+        self.entries.push(entry);
+        if self.entries.len() > self.max_entries {
+            self.entries.remove(0);
+        }
+    }
+
+    pub fn search(&self, query: &str) -> Vec<&QueryHistoryEntry> {
+        self.entries.iter()
+            .filter(|e| e.sql.to_lowercase().contains(&query.to_lowercase()))
+            .rev()
+            .collect()
+    }
+
+    pub fn for_connection(&self, connection_id: &ConnectionId) -> Vec<&QueryHistoryEntry> {
+        self.entries.iter()
+            .filter(|e| &e.connection_id == connection_id)
+            .rev()
+            .collect()
+    }
+
+    /// Persist to KVP store
+    pub fn save(&self, cx: &App) -> Result<()> {
+        // Use db::kvp::KeyValueStore
+        todo!()
+    }
+
+    /// Load from KVP store
+    pub fn load(cx: &App) -> Result<Self> {
+        todo!()
+    }
+}
+```
 
 ### 2.8 Query cancellation
 
-Cancel a running query via:
-- PostgreSQL: `pg_cancel_backend(pid)`
-- MySQL: `KILL QUERY <id>`
-- SQLite: `sqlite3_interrupt()`
+Cancel a running query via driver-specific mechanisms.
 
-Cancel button in the status bar and `Escape` keybinding.
+**Steps:**
+1. Implement `cancel()` on each `DatabaseConnection` implementation
+2. Wire `Escape` keybinding to `CancelQuery` action
+3. Show cancel button in toolbar while executing
+4. Emit `ExecutionFailed(DatabaseError::Cancelled)` on cancel
+
+```rust
+// Driver-specific cancellation implementations:
+//
+// PostgreSQL: pg_cancel_backend(pid)
+//   - Requires a separate connection to send the cancel signal
+//   - PID obtained from pg_stat_activity after query starts
+//
+// MySQL: KILL QUERY <id>
+//   - Requires a separate connection
+//   - Thread ID obtained from SHOW PROCESSLIST
+//
+// SQLite: sqlite3_interrupt()
+//   - Called on the same connection handle
+//   - Already implemented in SqliteConnection::cancel()
+```
 
 ### 2.9 Explain Plan (text + diagram)
+
+**Steps:**
+1. Create `crates/database_ui/src/explain_plan_viewer.rs`
+2. Implement text view (table of operations, costs, row estimates)
+3. Implement diagram view (tree rendering of plan nodes)
+4. Parse EXPLAIN output per driver into `ExplainPlan` struct
 
 Two views:
 1. **Table view**: Operations, object names, row estimates, costs
 2. **Diagram view**: Graphical execution plan with node graph
+
+```rust
+// crates/database_ui/src/explain_plan_viewer.rs
+
+pub struct ExplainPlanViewer {
+    plan: ExplainPlan,
+    view_mode: ExplainViewMode,
+    focus_handle: FocusHandle,
+}
+
+pub enum ExplainViewMode { Table, Diagram, RawText }
+
+impl Render for ExplainPlanViewer {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        match self.view_mode {
+            ExplainViewMode::Table => self.render_table_view(window, cx),
+            ExplainViewMode::Diagram => self.render_diagram_view(window, cx),
+            ExplainViewMode::RawText => self.render_raw_text(window, cx),
+        }
+    }
+}
+
+impl ExplainPlanViewer {
+    fn render_table_view(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Table with columns: Operation | Object | Rows | Cost | Time
+        let headers = vec!["Operation", "Object", "Est. Rows", "Cost", "Actual Rows"]
+            .into_iter()
+            .map(|h| Label::new(h).into_any_element())
+            .collect::<Vec<_>>();
+
+        Table::new(5)
+            .header(headers.into_table_row(5))
+            .uniform_list("explain-nodes", self.plan.nodes.len(), |range, window, cx| {
+                // Render each plan node as a row with indentation
+                todo!()
+            })
+            .striped()
+    }
+
+    fn render_diagram_view(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Tree visualization of plan nodes
+        // Each node shows: operation name, cost bar, row count
+        // Lines connect parent to child nodes
+        todo!()
+    }
+
+    fn render_raw_text(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Read-only editor with the raw EXPLAIN output
+        todo!()
+    }
+}
+```
 
 ### 2.10 Execute to file
 
 Run a query and write results directly to a file in a chosen format,
 without loading them into the grid. Useful for large exports.
 
+**Steps:**
+1. Add `ExecuteToFile` action
+2. Show file picker dialog with format selection
+3. Stream results directly to file (no in-memory buffering)
+4. Show progress indicator during export
+
 ### 2.11 SQL formatting
 
 Integrate a SQL formatter (via LSP or dedicated formatter like `sqlformat`).
-Accessible via `Ctrl+Shift+I` or "Format Document" action.
 
-### 2.12 NEW: SQL Generator (DDL export)
+**Steps:**
+1. Add `FormatQuery` action (Ctrl+Shift+F)
+2. Use LSP formatting if available
+3. Fallback to `sqlformat` crate for local formatting
+4. Format selected text only if selection exists
+
+```rust
+impl QueryEditor {
+    pub fn format_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sql = self.get_sql_to_execute(cx);
+        // Try LSP formatting first, fallback to sqlformat crate
+        let formatted = sqlformat::format(
+            &sql,
+            &sqlformat::QueryParams::None,
+            &sqlformat::FormatOptions {
+                indent: sqlformat::Indent::Spaces(2),
+                uppercase: Some(true),
+                lines_between_queries: 2,
+            },
+        );
+        self.editor.update(cx, |editor, cx| {
+            editor.set_text(&formatted, window, cx);
+        });
+    }
+}
+```
+
+### 2.12 SQL Generator (DDL export)
 
 Generate the complete DDL for an entire database or schema in one click.
 Right-click a schema in the Database Explorer > "Generate DDL" > choose output
 (clipboard, new buffer, or file).
+
+**Steps:**
+1. Implement `generate_ddl()` on `DatabaseConnection` (introspect_ddl for each object)
+2. Add "Generate DDL" to schema node context menu
+3. Show output picker: clipboard, new QueryEditor tab, or file
+4. Include options: DROP IF EXISTS, IF NOT EXISTS, comments
+
+```rust
+// crates/database_core/src/ddl_generator.rs
+
+pub struct DdlGeneratorOptions {
+    pub include_drop: bool,
+    pub if_not_exists: bool,
+    pub include_comments: bool,
+    pub include_indexes: bool,
+    pub include_constraints: bool,
+    pub object_filter: Option<String>,  // Regex filter
+}
+
+pub async fn generate_schema_ddl(
+    connection: &dyn DatabaseConnection,
+    schema: &str,
+    options: &DdlGeneratorOptions,
+) -> Result<String> {
+    let objects = connection.introspect_names().await?;
+    let mut ddl = String::new();
+
+    // Order: sequences, types, tables, views, functions, indexes
+    let ordered = order_by_dependencies(&objects);
+
+    for object in &ordered {
+        if let Some(filter) = &options.object_filter {
+            let regex = regex::Regex::new(filter)?;
+            if !regex.is_match(&object.name) { continue; }
+        }
+
+        if options.include_drop {
+            ddl.push_str(&format!("DROP {} IF EXISTS {};\n",
+                object.object_type.sql_keyword(),
+                object.name,
+            ));
+        }
+
+        let object_ddl = connection.introspect_ddl(object).await?;
+        ddl.push_str(&object_ddl);
+        ddl.push_str(";\n\n");
+    }
+
+    Ok(ddl)
+}
+```
 
 ---
 
@@ -1837,13 +4212,117 @@ Right-click a schema in the Database Explorer > "Generate DDL" > choose output
 
 ### 3.1 Inline editing + type-aware cell editors
 
-Double-click a cell to edit. Cell editor adapts to column type:
+Double-click a cell to edit. Cell editor adapts to column type.
+
+**Steps:**
+1. Implement `ResultGrid::start_editing()` (already sketched in 2.4)
+2. Create type-specific editor configurations
+3. Implement validation per type before committing
+4. Handle Tab navigation between cells while editing
+
+```rust
+// crates/database_ui/src/result_grid.rs (cell editor section)
+
+/// Create the appropriate inline editor for a column type
+fn create_cell_editor(
+    column: &ColumnInfo,
+    current_value: &CellValue,
+    window: &mut Window,
+    cx: &mut Context<ResultGrid>,
+) -> Entity<Editor> {
+    match &column.normalized_type {
+        DataType::Boolean => {
+            // Boolean cells don't use an editor — Space toggles directly
+            unreachable!("Boolean cells use toggle, not editor")
+        }
+        DataType::Integer | DataType::BigInt | DataType::SmallInt => {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_text(&current_value.display_string(&NumberFormatSettings::default()), window, cx);
+                editor.select_all(&Default::default(), window, cx);
+                editor
+            });
+            // Add numeric validation on input
+            editor
+        }
+        DataType::Json | DataType::Jsonb => {
+            // Large JSON opens ValueEditor panel instead
+            // Small JSON gets inline editor
+            let text = match current_value {
+                CellValue::Json(v) => serde_json::to_string_pretty(v).unwrap_or_default(),
+                _ => current_value.display_string(&NumberFormatSettings::default()),
+            };
+            cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_text(&text, window, cx);
+                editor
+            })
+        }
+        DataType::Date | DataType::Timestamp | DataType::TimestampTz => {
+            cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_text(&current_value.display_string(&NumberFormatSettings::default()), window, cx);
+                editor.select_all(&Default::default(), window, cx);
+                // Placeholder hint for date format
+                editor
+            })
+        }
+        _ => {
+            // Default text editor
+            cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_text(&current_value.display_string(&NumberFormatSettings::default()), window, cx);
+                editor.select_all(&Default::default(), window, cx);
+                editor
+            })
+        }
+    }
+}
+
+/// Validate edited value before committing
+fn validate_cell_value(text: &str, column: &ColumnInfo) -> Result<CellValue, String> {
+    if text.eq_ignore_ascii_case("null") {
+        if column.is_nullable {
+            return Ok(CellValue::Null);
+        } else {
+            return Err(format!("Column '{}' does not allow NULL", column.name));
+        }
+    }
+    match &column.normalized_type {
+        DataType::Integer | DataType::BigInt | DataType::SmallInt => {
+            text.parse::<i64>()
+                .map(CellValue::Integer)
+                .map_err(|_| format!("'{}' is not a valid integer", text))
+        }
+        DataType::Float | DataType::Double => {
+            text.parse::<f64>()
+                .map(CellValue::Float)
+                .map_err(|_| format!("'{}' is not a valid number", text))
+        }
+        DataType::Boolean => {
+            match text.to_lowercase().as_str() {
+                "true" | "t" | "1" | "yes" => Ok(CellValue::Boolean(true)),
+                "false" | "f" | "0" | "no" => Ok(CellValue::Boolean(false)),
+                _ => Err(format!("'{}' is not a valid boolean", text)),
+            }
+        }
+        DataType::Json | DataType::Jsonb => {
+            serde_json::from_str::<serde_json::Value>(text)
+                .map(CellValue::Json)
+                .map_err(|e| format!("Invalid JSON: {}", e))
+        }
+        _ => Ok(CellValue::String(text.to_string())),
+    }
+}
+```
+
+Cell editor types:
 - Text: inline text input
 - Integer/Float: numeric input with validation
-- Date/Time: date picker or formatted input
-- JSON: opens Value Editor with syntax highlighting
+- Date/Time: formatted input with placeholder hint
+- JSON: inline for small values, opens Value Editor for large
 - Boolean: toggle (see 3.2)
-- BLOB: hex editor or "Open in Value Editor"
+- BLOB: "Open in Value Editor" button
 
 ### 3.2 Boolean toggle
 
@@ -1851,15 +4330,225 @@ Double-click a cell to edit. Cell editor adapts to column type:
 - `t` → true, `f` → false, `n` → null, `d` → default
 - Dropdown of possible values on `Enter`
 
+**Steps:**
+1. Register Space as toggle action in `ResultGrid` for boolean columns
+2. Implement t/f/n/d single-key shortcuts in grid normal mode
+3. Create pending edit on toggle
+
+```rust
+impl ResultGrid {
+    fn toggle_boolean(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
+        let current = &self.rows[row][col];
+        let new_value = match current {
+            CellValue::Boolean(true) => CellValue::Boolean(false),
+            CellValue::Boolean(false) => CellValue::Null,
+            CellValue::Null => CellValue::Boolean(true),
+            _ => return,
+        };
+        self.apply_edit(row, col, new_value, cx);
+    }
+
+    fn set_boolean(&mut self, row: usize, col: usize, value: CellValue, cx: &mut Context<Self>) {
+        if !matches!(self.columns[col].info.normalized_type, DataType::Boolean) {
+            return;
+        }
+        self.apply_edit(row, col, value, cx);
+    }
+
+    fn apply_edit(&mut self, row: usize, col: usize, new_value: CellValue, cx: &mut Context<Self>) {
+        let original = self.rows[row][col].clone();
+        if new_value != original {
+            let operation = DataOperation::UpdateCell {
+                row, col,
+                old_value: original.clone(),
+                new_value: new_value.clone(),
+            };
+            self.edit_history.push(operation);
+            self.pending_edits.insert(
+                CellAddress { row, col },
+                PendingEdit { original, current: new_value, kind: EditKind::Update },
+            );
+            cx.emit(ResultGridEvent::PendingChangesUpdated {
+                count: self.pending_edits.len(),
+            });
+            cx.notify();
+        }
+    }
+}
+```
+
 ### 3.3 Value Editor panel
 
-Side panel for editing large or complex values:
-- JSON/XML: pretty-printed with syntax highlighting, collapsible nodes
-- Text: multiline editor
-- Images: preview display (PNG, JPEG, etc.)
-- Hex: binary data viewer
+Side panel for editing large or complex values.
 
-**NEW: LOB size hint** — When a value exceeds `max_lob_size`, display an
+**Steps:**
+1. Create `crates/database_ui/src/value_editor.rs`
+2. Implement `Panel` + `Focusable` + `EventEmitter<PanelEvent>` + `Render`
+3. Implement content type detection (JSON, XML, image, hex)
+4. Create `Entity<Editor>` with appropriate language mode per type
+5. Implement hex view for binary data
+6. Implement image preview for detected image BLOBs
+
+(See detailed structure in [UI/Interface Specification — Section 8](#8-side-panels).)
+
+```rust
+// crates/database_ui/src/value_editor.rs
+
+pub struct ValueEditor {
+    content_editor: Option<Entity<Editor>>,
+    content_type: ContentType,
+    source_cell: Option<CellAddress>,
+    source_grid: Option<WeakEntity<ResultGrid>>,
+    is_read_only: bool,
+    focus_handle: FocusHandle,
+    width: Option<Pixels>,
+    position: DockPosition,
+}
+
+pub enum ContentType {
+    Json,
+    Xml,
+    PlainText,
+    Hex { data: Vec<u8> },
+    Image { data: Arc<[u8]>, format: ImageFormat },
+}
+
+pub enum ImageFormat { Png, Jpeg, Gif, Webp, Unknown }
+
+impl ValueEditor {
+    pub fn set_content(
+        &mut self,
+        value: &CellValue,
+        column: &ColumnInfo,
+        source_cell: CellAddress,
+        source_grid: WeakEntity<ResultGrid>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.source_cell = Some(source_cell);
+        self.source_grid = Some(source_grid);
+
+        match value {
+            CellValue::Json(json) => {
+                let text = serde_json::to_string_pretty(json).unwrap_or_default();
+                self.content_type = ContentType::Json;
+                self.create_editor_with_language(&text, "JSON", window, cx);
+            }
+            CellValue::String(s) if looks_like_xml(s) => {
+                self.content_type = ContentType::Xml;
+                self.create_editor_with_language(s, "XML", window, cx);
+            }
+            CellValue::String(s) => {
+                self.content_type = ContentType::PlainText;
+                self.create_editor_with_language(s, "Plain Text", window, cx);
+            }
+            CellValue::Bytes(bytes) => {
+                if let Some(format) = detect_image_format(bytes) {
+                    self.content_type = ContentType::Image {
+                        data: bytes.clone().into(),
+                        format,
+                    };
+                    self.content_editor = None; // Image uses gpui::img() instead
+                } else {
+                    self.content_type = ContentType::Hex { data: bytes.clone() };
+                    let hex_text = format_hex_view(bytes);
+                    self.create_editor_with_language(&hex_text, "Plain Text", window, cx);
+                }
+            }
+            _ => {
+                let text = value.display_string(&NumberFormatSettings::default());
+                self.content_type = ContentType::PlainText;
+                self.create_editor_with_language(&text, "Plain Text", window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn create_editor_with_language(
+        &mut self,
+        text: &str,
+        language: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::multi_line(window, cx);
+            editor.set_text(text, window, cx);
+            if self.is_read_only {
+                editor.set_read_only(true);
+            }
+            // Set language mode via language registry
+            editor
+        });
+        self.content_editor = Some(editor);
+    }
+}
+
+impl Render for ValueEditor {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .child(self.render_header(window, cx))
+            .child(match &self.content_type {
+                ContentType::Image { data, .. } => {
+                    div()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .child(gpui::img(data.clone()))
+                        .into_any_element()
+                }
+                _ => {
+                    if let Some(editor) = &self.content_editor {
+                        div().flex_1().child(editor.clone()).into_any_element()
+                    } else {
+                        div().flex_1().into_any_element()
+                    }
+                }
+            })
+    }
+}
+
+/// Format bytes as hex view: offset | hex bytes | ASCII
+fn format_hex_view(data: &[u8]) -> String {
+    let mut output = String::new();
+    for (offset, chunk) in data.chunks(16).enumerate() {
+        // Offset column
+        output.push_str(&format!("{:08x}  ", offset * 16));
+        // Hex columns
+        for (i, byte) in chunk.iter().enumerate() {
+            output.push_str(&format!("{:02x} ", byte));
+            if i == 7 { output.push(' '); }
+        }
+        // Pad if last line is short
+        for _ in chunk.len()..16 {
+            output.push_str("   ");
+        }
+        output.push_str(" |");
+        // ASCII column
+        for byte in chunk {
+            let c = if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            };
+            output.push(c);
+        }
+        output.push_str("|\n");
+    }
+    output
+}
+
+fn detect_image_format(data: &[u8]) -> Option<ImageFormat> {
+    if data.starts_with(b"\x89PNG") { Some(ImageFormat::Png) }
+    else if data.starts_with(b"\xFF\xD8\xFF") { Some(ImageFormat::Jpeg) }
+    else if data.starts_with(b"GIF8") { Some(ImageFormat::Gif) }
+    else if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") { Some(ImageFormat::Webp) }
+    else { None }
+}
+```
+
+**LOB size hint** — When a value exceeds `max_lob_size`, display an
 interactive hint: "Value truncated (2.4 MB). Click to load full content."
 Clicking loads the full value into the Value Editor.
 
@@ -1927,12 +4616,154 @@ Keyboard shortcuts: `Ctrl+Page Down` / `Ctrl+Page Up`.
   that lack proper constraints. Defined via regex or explicit column mapping.
   Stored in project settings.
 
+**Steps:**
+1. Detect FK columns via introspection metadata
+2. Render FK values as clickable links (underlined, accent color)
+3. On click: open referenced table in new tab with WHERE filter
+4. Implement "Find Usages" reverse lookup
+5. Add virtual FK definition UI
+
+```rust
+// crates/database_ui/src/result_grid.rs (FK navigation section)
+
+impl ResultGrid {
+    /// Navigate to the referenced row via FK
+    pub fn navigate_to_foreign_key(
+        &self,
+        row: usize,
+        col: usize,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let column = &self.columns[col];
+        let fk_ref = match &column.info.foreign_key_ref {
+            Some(fk) => fk.clone(),
+            None => return,
+        };
+
+        let value = &self.rows[row][col];
+        let sql = format!(
+            "SELECT * FROM {} WHERE {} = {}",
+            fk_ref.referenced_table.qualified_name(),
+            fk_ref.referenced_column,
+            value.to_sql_literal(),
+        );
+
+        // Open a new QueryEditor tab with this query and execute it
+        // workspace.open_query_editor(sql, connection_id, window, cx);
+    }
+
+    /// Find all rows in other tables that reference this row
+    pub fn find_fk_usages(
+        &self,
+        row: usize,
+        connection: &dyn DatabaseConnection,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<FkUsage>>> {
+        // Query information_schema for all tables with FKs pointing to this table
+        // For each, execute a count query
+        todo!()
+    }
+}
+
+pub struct FkUsage {
+    pub referencing_table: TableRef,
+    pub referencing_column: String,
+    pub count: usize,
+}
+
+/// Virtual FK definition (stored in project settings)
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct VirtualForeignKey {
+    pub name: String,
+    pub source_table: String,
+    pub source_column: String,
+    pub target_table: String,
+    pub target_column: String,
+}
+```
+
 ### 3.14 Aggregate View
 
-Select multiple cells > panel on right shows:
-- Count, Sum, Average, Min, Max (built-in, 9 aggregators)
-- Custom aggregator scripts (Lua or Rhai, stored in config dir)
-- Dynamic update as selection changes
+Select multiple cells > floating popover shows aggregated values.
+
+**Steps:**
+1. Create `crates/database_ui/src/aggregate_view.rs`
+2. Calculate aggregates on selection change
+3. Render as `Popover` anchored to selection
+4. Support pinning (click keeps visible)
+
+(See [UI/Interface Specification — Section 8, AggregateView](#8-side-panels).)
+
+```rust
+// crates/database_ui/src/aggregate_view.rs
+
+pub struct AggregateView {
+    values: Vec<AggregateResult>,
+    is_pinned: bool,
+    anchor_position: Point<Pixels>,
+}
+
+pub struct AggregateResult {
+    pub name: SharedString,
+    pub value: String,
+}
+
+impl AggregateView {
+    pub fn calculate(cells: &[(usize, usize)], rows: &[Vec<CellValue>], columns: &[ColumnDef]) -> Vec<AggregateResult> {
+        let numeric_values: Vec<f64> = cells.iter()
+            .filter_map(|(row, col)| match &rows[*row][*col] {
+                CellValue::Integer(i) => Some(*i as f64),
+                CellValue::Float(f) => Some(*f),
+                _ => None,
+            })
+            .collect();
+
+        if numeric_values.is_empty() {
+            return vec![
+                AggregateResult { name: "Count".into(), value: cells.len().to_string() },
+            ];
+        }
+
+        let count = numeric_values.len();
+        let sum: f64 = numeric_values.iter().sum();
+        let avg = sum / count as f64;
+        let min = numeric_values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = numeric_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        vec![
+            AggregateResult { name: "Count".into(), value: count.to_string() },
+            AggregateResult { name: "Sum".into(), value: format!("{:.2}", sum) },
+            AggregateResult { name: "Avg".into(), value: format!("{:.2}", avg) },
+            AggregateResult { name: "Min".into(), value: format!("{:.2}", min) },
+            AggregateResult { name: "Max".into(), value: format!("{:.2}", max) },
+        ]
+    }
+}
+
+impl Render for AggregateView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Popover::new()
+            .child(
+                v_flex()
+                    .p_2()
+                    .gap_1()
+                    .children(self.values.iter().map(|v| {
+                        h_flex()
+                            .justify_between()
+                            .gap_4()
+                            .child(Label::new(v.name.clone()).size(LabelSize::Small).color(Color::Muted))
+                            .child(Label::new(v.value.clone()).size(LabelSize::Small))
+                    }))
+            )
+    }
+}
+```
+
+Built-in aggregators: Count, Sum, Average, Min, Max, Median, StdDev, Variance, Distinct Count.
+Custom aggregator scripts (Lua or Rhai, stored in config dir).
+Dynamic update as selection changes.
 
 ### 3.15 CRUD operations (add/delete/clone row)
 
@@ -1941,24 +4772,273 @@ Select multiple cells > panel on right shows:
 - Clone row: duplicates an existing row for easy insertion
 - All changes are local until submitted
 
+**Steps:**
+1. Implement `AddRow` action → append row with default values
+2. Implement `DeleteSelectedRows` → mark rows as deleted
+3. Implement `CloneRow` → duplicate row data as insert
+4. Track all operations in `DataEditHistory`
+
+```rust
+impl ResultGrid {
+    pub fn add_row(&mut self, cx: &mut Context<Self>) {
+        let default_values: Vec<CellValue> = self.columns.iter()
+            .map(|col| {
+                if let Some(default) = &col.info.default_value {
+                    CellValue::String(default.clone()) // Will be parsed on commit
+                } else if col.info.is_nullable {
+                    CellValue::Null
+                } else {
+                    CellValue::String(String::new())
+                }
+            })
+            .collect();
+
+        let new_row_index = self.rows.len();
+        let mut rows = Arc::make_mut(&mut self.rows);
+        rows.push(default_values.clone());
+
+        self.edit_history.push(DataOperation::InsertRow {
+            row: new_row_index,
+            data: default_values,
+        });
+        self.pending_edits.insert(
+            CellAddress { row: new_row_index, col: 0 },
+            PendingEdit {
+                original: CellValue::Null,
+                current: CellValue::Null,
+                kind: EditKind::Insert,
+            },
+        );
+        self.selection = GridSelection::Cell { row: new_row_index, col: 0 };
+        cx.emit(ResultGridEvent::PendingChangesUpdated { count: self.pending_edits.len() });
+        cx.notify();
+    }
+
+    pub fn delete_selected_rows(&mut self, cx: &mut Context<Self>) {
+        let rows_to_delete = match &self.selection {
+            GridSelection::Rows(rows) => rows.clone(),
+            GridSelection::Cell { row, .. } => vec![*row],
+            GridSelection::Range { start, end } => (start.0..=end.0).collect(),
+            _ => return,
+        };
+
+        for row_index in &rows_to_delete {
+            let row_data = self.rows[*row_index].clone();
+            self.edit_history.push(DataOperation::DeleteRow {
+                row: *row_index,
+                data: row_data,
+            });
+            // Mark first cell of row as deleted (the row styling handles the rest)
+            self.pending_edits.insert(
+                CellAddress { row: *row_index, col: 0 },
+                PendingEdit {
+                    original: self.rows[*row_index][0].clone(),
+                    current: CellValue::Null,
+                    kind: EditKind::Delete,
+                },
+            );
+        }
+        cx.emit(ResultGridEvent::PendingChangesUpdated { count: self.pending_edits.len() });
+        cx.notify();
+    }
+
+    pub fn clone_row(&mut self, row_index: usize, cx: &mut Context<Self>) {
+        let cloned_data = self.rows[row_index].clone();
+        let new_row_index = self.rows.len();
+        let mut rows = Arc::make_mut(&mut self.rows);
+        rows.push(cloned_data.clone());
+
+        self.edit_history.push(DataOperation::CloneRow {
+            source_row: row_index,
+            new_row: new_row_index,
+        });
+        self.pending_edits.insert(
+            CellAddress { row: new_row_index, col: 0 },
+            PendingEdit {
+                original: CellValue::Null,
+                current: cloned_data[0].clone(),
+                kind: EditKind::Insert,
+            },
+        );
+        cx.emit(ResultGridEvent::PendingChangesUpdated { count: self.pending_edits.len() });
+        cx.notify();
+    }
+}
+```
+
 ### 3.16 DML Preview before commit
 
 Before submitting changes, display a dialog showing the exact SQL that will
 be executed (INSERT/UPDATE/DELETE statements). User can review and confirm.
 
-### 3.17 Undo/Redo transactional
+**Steps:**
+1. Generate DML from `pending_edits` via `ResultGrid::generate_dml()`
+2. Show in a `ModalView` with syntax-highlighted SQL
+3. Confirm button executes all statements in a transaction
+4. Cancel reverts to the pending state (no changes lost)
 
 ```rust
+// crates/database_ui/src/dml_preview.rs
+
+pub struct DmlPreviewDialog {
+    statements: Vec<String>,
+    preview_editor: Entity<Editor>,
+    table_ref: TableRef,
+    connection_id: ConnectionId,
+    focus_handle: FocusHandle,
+}
+
+impl ModalView for DmlPreviewDialog {
+    fn fade_out_background(&self) -> bool { true }
+}
+
+impl Render for DmlPreviewDialog {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        Modal::new("dml-preview", ScrollHandle::new())
+            .header(ModalHeader::new().headline("Review Pending Changes"))
+            .section(
+                div()
+                    .p_2()
+                    .child(Label::new(format!("{} statements", self.statements.len()))
+                        .size(LabelSize::Small).color(Color::Muted))
+                    .child(self.preview_editor.clone())
+            )
+            .footer(
+                ModalFooter::new()
+                    .start_slot(
+                        Button::new("cancel", "Cancel")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.emit(DismissEvent);
+                            }))
+                    )
+                    .end_slot(
+                        Button::new("commit", "Commit Changes")
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.execute_commit(window, cx);
+                            }))
+                    )
+            )
+    }
+}
+```
+
+### 3.17 Undo/Redo transactional
+
+**Steps:**
+1. Create `crates/database_core/src/data_edit_history.rs`
+2. Implement operation stack with cursor
+3. Wire `Ctrl+Z` / `Ctrl+Shift+Z` to undo/redo in grid context
+4. Apply undo/redo to both `pending_edits` map and display
+
+```rust
+// crates/database_core/src/data_edit_history.rs
+
 pub struct DataEditHistory {
     operations: Vec<DataOperation>,
-    cursor: usize,
+    cursor: usize,  // Points to next operation slot
 }
 
 pub enum DataOperation {
-    UpdateCell { row: usize, col: usize, old_value: Value, new_value: Value },
-    InsertRow { row: usize, data: Vec<Value> },
-    DeleteRow { row: usize, data: Vec<Value> },
+    UpdateCell { row: usize, col: usize, old_value: CellValue, new_value: CellValue },
+    InsertRow { row: usize, data: Vec<CellValue> },
+    DeleteRow { row: usize, data: Vec<CellValue> },
     CloneRow { source_row: usize, new_row: usize },
+}
+
+impl DataEditHistory {
+    pub fn new() -> Self {
+        Self { operations: Vec::new(), cursor: 0 }
+    }
+
+    pub fn push(&mut self, operation: DataOperation) {
+        // Truncate any redo history
+        self.operations.truncate(self.cursor);
+        self.operations.push(operation);
+        self.cursor += 1;
+    }
+
+    pub fn undo(&mut self) -> Option<&DataOperation> {
+        if self.cursor == 0 { return None; }
+        self.cursor -= 1;
+        Some(&self.operations[self.cursor])
+    }
+
+    pub fn redo(&mut self) -> Option<&DataOperation> {
+        if self.cursor >= self.operations.len() { return None; }
+        let operation = &self.operations[self.cursor];
+        self.cursor += 1;
+        Some(operation)
+    }
+
+    pub fn can_undo(&self) -> bool { self.cursor > 0 }
+    pub fn can_redo(&self) -> bool { self.cursor < self.operations.len() }
+    pub fn operation_count(&self) -> usize { self.operations.len() }
+
+    /// Summary of pending changes for UI display
+    pub fn pending_summary(&self) -> (usize, usize, usize) {
+        let mut inserts = 0;
+        let mut updates = 0;
+        let mut deletes = 0;
+        for op in &self.operations[..self.cursor] {
+            match op {
+                DataOperation::InsertRow { .. } | DataOperation::CloneRow { .. } => inserts += 1,
+                DataOperation::UpdateCell { .. } => updates += 1,
+                DataOperation::DeleteRow { .. } => deletes += 1,
+            }
+        }
+        (inserts, updates, deletes)
+    }
+}
+
+impl ResultGrid {
+    pub fn undo_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(operation) = self.edit_history.undo() {
+            match operation {
+                DataOperation::UpdateCell { row, col, old_value, .. } => {
+                    self.pending_edits.remove(&CellAddress { row: *row, col: *col });
+                    // Restore original value in display
+                }
+                DataOperation::InsertRow { row, .. } => {
+                    let mut rows = Arc::make_mut(&mut self.rows);
+                    if *row < rows.len() { rows.remove(*row); }
+                    self.pending_edits.remove(&CellAddress { row: *row, col: 0 });
+                }
+                DataOperation::DeleteRow { row, .. } => {
+                    self.pending_edits.remove(&CellAddress { row: *row, col: 0 });
+                }
+                DataOperation::CloneRow { new_row, .. } => {
+                    let mut rows = Arc::make_mut(&mut self.rows);
+                    if *new_row < rows.len() { rows.remove(*new_row); }
+                    self.pending_edits.remove(&CellAddress { row: *new_row, col: 0 });
+                }
+            }
+            cx.emit(ResultGridEvent::PendingChangesUpdated { count: self.pending_edits.len() });
+            cx.notify();
+        }
+    }
+
+    pub fn redo_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(operation) = self.edit_history.redo() {
+            // Re-apply the operation (inverse of undo)
+            match operation {
+                DataOperation::UpdateCell { row, col, new_value, old_value } => {
+                    self.pending_edits.insert(
+                        CellAddress { row: *row, col: *col },
+                        PendingEdit {
+                            original: old_value.clone(),
+                            current: new_value.clone(),
+                            kind: EditKind::Update,
+                        },
+                    );
+                }
+                // Similar for other variants...
+                _ => {}
+            }
+            cx.emit(ResultGridEvent::PendingChangesUpdated { count: self.pending_edits.len() });
+            cx.notify();
+        }
+    }
 }
 ```
 
@@ -2019,7 +5099,13 @@ Hover on a cell > popup showing:
 
 ### 4.1 Export multi-format
 
-Export from any data grid (table, query result, CSV file):
+Export from any data grid (table, query result, CSV file).
+
+**Steps:**
+1. Create `crates/database_ui/src/export.rs`
+2. Implement `ExportFormat` trait with format-specific serializers
+3. Create export dialog (`ModalView`) with format selection + options
+4. Implement streaming export for large datasets (no full in-memory buffer)
 
 | Format | Implementation |
 |---|---|
@@ -2032,10 +5118,169 @@ Export from any data grid (table, query result, CSV file):
 | Markdown | Custom formatter |
 | Excel (xlsx) | `xlsxwriter` or `calamine` |
 
+```rust
+// crates/database_ui/src/export.rs
+
+pub trait DataExporter: Send + Sync {
+    fn format_name(&self) -> &str;
+    fn file_extension(&self) -> &str;
+    fn export_header(&self, columns: &[ColumnDef]) -> Result<String>;
+    fn export_row(&self, row: &[CellValue], columns: &[ColumnDef]) -> Result<String>;
+    fn export_footer(&self) -> Result<String> { Ok(String::new()) }
+}
+
+pub struct CsvExporter {
+    pub delimiter: u8,
+    pub quote: bool,
+    pub include_header: bool,
+}
+
+impl DataExporter for CsvExporter {
+    fn format_name(&self) -> &str { "CSV" }
+    fn file_extension(&self) -> &str { "csv" }
+
+    fn export_header(&self, columns: &[ColumnDef]) -> Result<String> {
+        if !self.include_header { return Ok(String::new()); }
+        let names: Vec<&str> = columns.iter().map(|c| c.info.name.as_str()).collect();
+        Ok(names.join(&String::from(self.delimiter as char)) + "\n")
+    }
+
+    fn export_row(&self, row: &[CellValue], _columns: &[ColumnDef]) -> Result<String> {
+        let values: Vec<String> = row.iter()
+            .map(|v| v.display_string(&NumberFormatSettings::default()))
+            .collect();
+        Ok(values.join(&String::from(self.delimiter as char)) + "\n")
+    }
+}
+
+pub struct SqlInsertExporter {
+    pub table_name: String,
+    pub batch_size: usize,
+}
+
+impl DataExporter for SqlInsertExporter {
+    fn format_name(&self) -> &str { "SQL INSERT" }
+    fn file_extension(&self) -> &str { "sql" }
+
+    fn export_header(&self, columns: &[ColumnDef]) -> Result<String> {
+        Ok(String::new())
+    }
+
+    fn export_row(&self, row: &[CellValue], columns: &[ColumnDef]) -> Result<String> {
+        let col_names: Vec<&str> = columns.iter().map(|c| c.info.name.as_str()).collect();
+        let values: Vec<String> = row.iter().map(|v| v.to_sql_literal()).collect();
+        Ok(format!(
+            "INSERT INTO {} ({}) VALUES ({});\n",
+            self.table_name,
+            col_names.join(", "),
+            values.join(", "),
+        ))
+    }
+}
+
+pub struct JsonExporter {
+    pub pretty: bool,
+    pub array_format: bool,  // true: [{...},...], false: one object per line
+}
+
+pub struct MarkdownExporter;
+pub struct HtmlExporter;
+pub struct ExcelExporter;
+
+/// Export dialog for selecting format and options
+pub struct ExportDialog {
+    format: ExportFormat,
+    destination: ExportDestination,
+    include_header: bool,
+    selection_only: bool,
+    focus_handle: FocusHandle,
+}
+
+pub enum ExportDestination {
+    File(PathBuf),
+    Clipboard,
+    NewBuffer,
+}
+
+/// Main export function
+pub async fn export_data(
+    exporter: &dyn DataExporter,
+    columns: &[ColumnDef],
+    rows: &[Vec<CellValue>],
+    destination: &ExportDestination,
+) -> Result<usize> {
+    let mut output = exporter.export_header(columns)?;
+    for row in rows {
+        output.push_str(&exporter.export_row(row, columns)?);
+    }
+    output.push_str(&exporter.export_footer()?);
+
+    match destination {
+        ExportDestination::File(path) => {
+            std::fs::write(path, &output)?;
+        }
+        ExportDestination::Clipboard => {
+            // Use GPUI clipboard API
+        }
+        ExportDestination::NewBuffer => {
+            // Open in new editor tab
+        }
+    }
+    Ok(rows.len())
+}
+```
+
 ### 4.2 Clipboard export
 
 `Ctrl+C` copies selection in the currently active extractor format.
 Configurable default format (CSV, JSON, SQL INSERT, Markdown).
+
+**Steps:**
+1. Implement `copy_selection()` on `ResultGrid`
+2. Use default format from `DatabaseSettings.default_export_format`
+3. Support Ctrl+Shift+C for "Copy As..." format picker
+
+```rust
+impl ResultGrid {
+    pub fn copy_selection(&self, format: ExportFormat, cx: &mut App) {
+        let (columns, rows) = self.selected_data();
+        let exporter = create_exporter(format, &self.table_ref_name());
+        let mut output = exporter.export_header(&columns).unwrap_or_default();
+        for row in &rows {
+            output.push_str(&exporter.export_row(row, &columns).unwrap_or_default());
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(output));
+    }
+
+    fn selected_data(&self) -> (Vec<ColumnDef>, Vec<Vec<CellValue>>) {
+        match &self.selection {
+            GridSelection::Cell { row, col } => {
+                (vec![self.columns[*col].clone()], vec![vec![self.rows[*row][*col].clone()]])
+            }
+            GridSelection::Range { start, end } => {
+                let cols: Vec<ColumnDef> = (start.1..=end.1)
+                    .map(|c| self.columns[c].clone())
+                    .collect();
+                let rows: Vec<Vec<CellValue>> = (start.0..=end.0)
+                    .map(|r| (start.1..=end.1).map(|c| self.rows[r][c].clone()).collect())
+                    .collect();
+                (cols, rows)
+            }
+            GridSelection::Rows(indices) => {
+                let cols = self.columns.clone();
+                let rows: Vec<Vec<CellValue>> = indices.iter()
+                    .map(|r| self.rows[*r].clone())
+                    .collect();
+                (cols, rows)
+            }
+            GridSelection::All => {
+                (self.columns.clone(), self.rows.as_ref().clone())
+            }
+            _ => (vec![], vec![]),
+        }
+    }
+}
+```
 
 ### 4.3 Custom extractors (Lua or Rhai scripts)
 
@@ -2128,18 +5373,106 @@ impl AgentTool for ExecuteQueryTool {
 
 Returns DDL + columns + FK + indexes for a database object.
 
+```rust
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct DescribeObjectToolInput {
+    /// The name of the database object (table, view, function).
+    pub object_name: String,
+    /// Name of the database connection.
+    pub connection: String,
+    /// Schema name (optional, uses default if omitted).
+    pub schema: Option<String>,
+    /// Level of detail: "summary" (columns only), "full" (DDL + FK + indexes).
+    #[serde(default = "default_detail_level")]
+    pub detail: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DescribeObjectToolOutput {
+    pub object_name: String,
+    pub object_type: String,
+    pub columns: Vec<ColumnSummary>,
+    pub primary_key: Option<Vec<String>>,
+    pub foreign_keys: Vec<ForeignKeySummary>,
+    pub indexes: Vec<IndexSummary>,
+    pub ddl: Option<String>,
+    pub row_count_estimate: Option<u64>,
+}
+
+impl AgentTool for DescribeObjectTool {
+    const NAME: &'static str = "describe_database_object";
+    fn kind() -> ToolKind { ToolKind::Other }
+    // Returns structured JSON with schema information
+}
+```
+
 ### 5.3 AgentTool: list_database_objects
 
 Lists tables, views, functions in a schema. Supports filtering by type.
+
+```rust
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ListObjectsToolInput {
+    /// Name of the database connection.
+    pub connection: String,
+    /// Schema name (optional).
+    pub schema: Option<String>,
+    /// Filter by type: "tables", "views", "functions", "all".
+    #[serde(default = "default_all")]
+    pub object_type: String,
+    /// Optional name pattern (SQL LIKE syntax).
+    pub pattern: Option<String>,
+}
+
+impl AgentTool for ListObjectsTool {
+    const NAME: &'static str = "list_database_objects";
+    fn kind() -> ToolKind { ToolKind::Other }
+}
+```
 
 ### 5.4 AgentTool: explain_query
 
 Runs EXPLAIN on a query and returns the execution plan.
 
+```rust
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ExplainQueryToolInput {
+    /// The SQL query to explain.
+    pub sql: String,
+    /// Name of the database connection.
+    pub connection: String,
+    /// Whether to run EXPLAIN ANALYZE (actually executes the query).
+    #[serde(default)]
+    pub analyze: bool,
+}
+
+impl AgentTool for ExplainQueryTool {
+    const NAME: &'static str = "explain_query";
+    fn kind() -> ToolKind { ToolKind::Other }
+}
+```
+
 ### 5.5 AgentTool: modify_data (with confirmation)
 
 Executes INSERT/UPDATE/DELETE. Requires user confirmation (`ToolKind::Write`).
 Shows DML preview before execution.
+
+```rust
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ModifyDataToolInput {
+    /// The SQL statement to execute (INSERT/UPDATE/DELETE/DDL).
+    pub sql: String,
+    /// Name of the database connection.
+    pub connection: String,
+    /// Human-readable description of what this modification does.
+    pub description: String,
+}
+
+impl AgentTool for ModifyDataTool {
+    const NAME: &'static str = "modify_data";
+    fn kind() -> ToolKind { ToolKind::Write } // Requires user confirmation
+}
+```
 
 ### 5.6 Schema context in AI chat (@db:, @table:, @schema:)
 
@@ -2242,6 +5575,75 @@ Full implementation using `tokio-postgres` or `sqlx`. Supports:
 - Advisory locks
 - pg_cancel_backend for cancellation
 
+**Steps:**
+1. Create `crates/database_core/src/drivers/postgres.rs`
+2. Implement `DatabaseDriver` + `DatabaseConnection`
+3. Implement type mapping from PostgreSQL OIDs to `DataType`
+4. Implement cancel via separate connection + `pg_cancel_backend()`
+5. Implement LISTEN/NOTIFY integration for live schema updates
+
+```rust
+// crates/database_core/src/drivers/postgres.rs
+
+pub struct PostgresDriver;
+
+impl DatabaseDriver for PostgresDriver {
+    fn driver_type(&self) -> DriverType { DriverType::Postgres }
+
+    fn supported_types(&self) -> Vec<DataType> {
+        vec![
+            DataType::Boolean, DataType::SmallInt, DataType::Integer,
+            DataType::BigInt, DataType::Float, DataType::Double,
+            DataType::Decimal { precision: None, scale: None },
+            DataType::Varchar { max_length: None }, DataType::Text,
+            DataType::Date, DataType::Time, DataType::Timestamp, DataType::TimestampTz,
+            DataType::Uuid, DataType::Json, DataType::Jsonb, DataType::Xml,
+            DataType::ByteArray, DataType::Array { element_type: Box::new(DataType::Text) },
+            DataType::Point, DataType::Geometry,
+        ]
+    }
+
+    async fn connect(&self, config: &ConnectionConfig) -> Result<Box<dyn DatabaseConnection>> {
+        let host = config.host.as_deref().unwrap_or("localhost");
+        let port = config.port.unwrap_or(5432);
+        let database = config.database.as_deref().unwrap_or("postgres");
+        let user = config.user.as_deref().unwrap_or("postgres");
+        // Build connection string, apply SSL config, connect via SSH tunnel if configured
+        todo!()
+    }
+}
+
+pub struct PostgresConnection {
+    client: tokio_postgres::Client,
+    cancel_token: tokio_postgres::CancelToken,
+    server_version: String,
+}
+
+#[async_trait]
+impl DatabaseConnection for PostgresConnection {
+    async fn cancel(&self) -> Result<()> {
+        self.cancel_token.cancel_query(tokio_postgres::NoTls).await?;
+        Ok(())
+    }
+
+    async fn introspect_names(&self) -> Result<Vec<SchemaObject>> {
+        let rows = self.client.query(
+            "SELECT schemaname, tablename, 'table' as type FROM pg_tables
+             WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+             UNION ALL
+             SELECT schemaname, viewname, 'view' FROM pg_views
+             WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+             ORDER BY schemaname, tablename",
+            &[],
+        ).await?;
+        // Map to SchemaObject vec
+        todo!()
+    }
+
+    // ... other trait methods
+}
+```
+
 ### 6.2 MySQL / MariaDB driver
 
 Implementation using `mysql_async` or `sqlx`. Supports:
@@ -2249,12 +5651,54 @@ Implementation using `mysql_async` or `sqlx`. Supports:
 - KILL QUERY for cancellation
 - Multiple result sets from stored procedures
 
+**Steps:**
+1. Create `crates/database_core/src/drivers/mysql.rs`
+2. Implement `DatabaseDriver` + `DatabaseConnection`
+3. Implement type mapping from MySQL types
+4. Implement cancel via separate connection + `KILL QUERY`
+5. Handle multiple result sets from procedures
+
+```rust
+// crates/database_core/src/drivers/mysql.rs
+
+pub struct MysqlDriver;
+pub struct MysqlConnection {
+    pool: mysql_async::Pool,
+    thread_id: u32,  // For KILL QUERY
+}
+
+#[async_trait]
+impl DatabaseConnection for MysqlConnection {
+    async fn cancel(&self) -> Result<()> {
+        let mut conn = self.pool.get_conn().await?;
+        conn.exec_drop(format!("KILL QUERY {}", self.thread_id), ()).await?;
+        Ok(())
+    }
+
+    async fn introspect_names(&self) -> Result<Vec<SchemaObject>> {
+        let mut conn = self.pool.get_conn().await?;
+        let rows: Vec<(String, String)> = conn.exec(
+            "SELECT TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+            (),
+        ).await?;
+        // Map to SchemaObject
+        todo!()
+    }
+}
+```
+
 ### 6.3 Microsoft SQL Server driver
 
 Implementation using `tiberius`. Supports:
 - Windows Authentication and SQL Authentication
 - TDS protocol
 - KILL for cancellation
+
+**Steps:**
+1. Create `crates/database_core/src/drivers/mssql.rs`
+2. Implement `DatabaseDriver` + `DatabaseConnection`
+3. Implement type mapping from SQL Server types
+4. Support both Windows and SQL authentication modes
 
 ### 6.4 Cloud connectivity (AWS RDS, GCP Cloud SQL, Azure SQL)
 
