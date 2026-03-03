@@ -7,6 +7,7 @@ data grid and database IDE experience to Zed, with agentic AI integration.
 
 - [Existing Foundation](#existing-foundation)
 - [Architecture Overview](#architecture-overview)
+- [Folder Structure Conventions](#folder-structure-conventions)
 - [Phase 0 — Infrastructure](#phase-0--infrastructure)
 - [Phase 1 — Connection & Schema](#phase-1--connection--schema)
 - [Phase 2 — Query Editor & Execution](#phase-2--query-editor--execution)
@@ -44,62 +45,16 @@ data grid and database IDE experience to Zed, with agentic AI integration.
 
 ### New Crates
 
-```
-crates/
-├── database_core/              # Business logic, no UI
-│   └── src/
-│       ├── database_core.rs            # Crate root
-│       ├── driver.rs                   # DatabaseDriver + DatabaseConnection traits
-│       ├── postgres_driver.rs          # PostgreSQL implementation
-│       ├── mysql_driver.rs             # MySQL / MariaDB implementation
-│       ├── sqlite_driver.rs            # SQLite implementation
-│       ├── introspection.rs            # Multi-level metadata loading with cache
-│       ├── query_executor.rs           # Async query execution with cancellation
-│       ├── schema.rs                   # Schema types (Table, Column, FK, Index, etc.)
-│       ├── history.rs                  # Query history per connection
-│       ├── data_edit_history.rs        # Undo/redo stack for data modifications
-│       ├── connection_pool.rs          # Connection pooling and watchdog
-│       ├── ssh_tunnel.rs              # SSH tunnel support
-│       └── errors.rs                   # DatabaseError types
-│
-├── database_ui/                # UI layer
-│   └── src/
-│       ├── database_ui.rs              # Crate root, panel registration
-│       ├── connection_manager.rs       # Entity<ConnectionManager>
-│       ├── connection_dialog.rs        # Connection configuration UI
-│       ├── database_explorer.rs        # Tree panel (Entity<DatabaseExplorer>)
-│       ├── query_editor.rs             # Specialized SQL buffer
-│       ├── result_grid.rs              # Extended DataTable for query results
-│       ├── value_editor.rs             # Side panel for cell editing
-│       ├── record_view.rs              # Single-row vertical view
-│       ├── aggregate_view.rs           # Multi-cell aggregation panel
-│       ├── quick_actions_toolbar.rs    # Floating context toolbar on cell selection
-│       ├── data_diff.rs                # Data comparison viewer
-│       ├── schema_diff.rs              # Schema comparison + migration DDL
-│       ├── export.rs                   # Multi-format export
-│       ├── import.rs                   # CSV/clipboard import wizard
-│       ├── table_designer.rs           # GUI dialog for CREATE/ALTER TABLE
-│       ├── explain_plan_viewer.rs      # Execution plan diagram
-│       └── er_diagram.rs              # Entity-relationship diagram viewer
-│
-├── database_ai/                # AI integration layer
-│   └── src/
-│       ├── database_ai.rs              # Crate root
-│       ├── schema_context.rs           # Provide schema context to AI
-│       ├── mention_provider.rs         # @db:, @table:, @schema: mentions
-│       ├── slash_commands.rs           # /db-schema, /db-query, /db-explain
-│       ├── tools/
-│       │   ├── execute_query_tool.rs   # AgentTool: execute_query
-│       │   ├── describe_object_tool.rs # AgentTool: describe_database_object
-│       │   ├── list_objects_tool.rs    # AgentTool: list_database_objects
-│       │   ├── explain_query_tool.rs   # AgentTool: explain_query
-│       │   └── modify_data_tool.rs     # AgentTool: modify_data
-│       ├── query_generator.rs          # Natural language to SQL
-│       ├── query_optimizer.rs          # AI-powered query optimization
-│       ├── plan_analyzer.rs            # Execution plan analysis
-│       ├── autonomous_agent.rs         # Multi-step autonomous agent with allowlist
-│       └── mcp_server.rs              # MCP server exposing DB resources/tools
-```
+Three new crates, following the separation of concerns pattern used across Zed
+(e.g., `agent` / `agent_ui` / `context_server`). Full folder layout and
+naming conventions are detailed in the
+[Folder Structure Conventions](#folder-structure-conventions) section below.
+
+| Crate | Responsibility | Key dependencies |
+|---|---|---|
+| `database_core` | Business logic, drivers, schema types — no UI | `sqlez`, `sqlx`, `tokio-postgres`, `russh` |
+| `database_ui` | All UI: panels, grids, dialogs, editors | `database_core`, `gpui`, `ui`, `workspace` |
+| `database_ai` | AI integration: tools, mentions, MCP server | `database_core`, `agent`, `context_server` |
 
 ### Core Traits
 
@@ -164,6 +119,257 @@ enum MentionUri {
     DatabaseTable { connection: String, table: String },
     DatabaseQuery { connection: String, sql: String },
 }
+```
+
+---
+
+## Folder Structure Conventions
+
+All new crates **must** follow Zed's established conventions. These rules are
+enforced by CLAUDE.md and are consistent across the entire codebase.
+
+### Rule 1: Named library root file, never `lib.rs`
+
+Every crate uses a descriptively named root file declared in `Cargo.toml`:
+
+```toml
+# crates/database_core/Cargo.toml
+[lib]
+name = "database_core"
+path = "src/database_core.rs"
+doctest = false
+```
+
+Existing examples from the repo:
+- `crates/agent/` → `[lib] path = "src/agent.rs"`
+- `crates/workspace/` → `[lib] path = "src/workspace.rs"`
+- `crates/ui/` → `[lib] path = "src/ui.rs"`
+- `crates/gpui/` → `[lib] path = "src/gpui.rs"`
+- `crates/project/` → `[lib] path = "src/project.rs"`
+- `crates/db/` → `[lib] path = "src/db.rs"`
+
+### Rule 2: Never use `mod.rs`
+
+Subdirectories use a **sibling `.rs` file** with the same name as the directory
+to declare and re-export the module. The `mod.rs` pattern is banned.
+
+```
+# CORRECT
+src/
+├── database_core.rs          # crate root, declares `mod tools;`
+├── tools.rs                  # sibling file: declares sub-modules, re-exports
+└── tools/
+    ├── execute_query.rs
+    ├── describe_object.rs
+    └── list_objects.rs
+
+# WRONG — never do this
+src/
+└── tools/
+    ├── mod.rs               # ← BANNED
+    ├── execute_query.rs
+    └── ...
+```
+
+### Rule 3: Flat modules with logical subdirectories
+
+Small crates keep everything flat under `src/`. Larger crates group related
+files into subdirectories but keep the module tree shallow (1 level deep).
+
+```
+# Small crate (flat)
+crates/credentials_provider/src/
+└── credentials_provider.rs          # everything in one file
+
+# Medium crate (flat with siblings)
+crates/db/src/
+├── db.rs                            # crate root
+├── kvp.rs
+└── query.rs
+
+# Large crate (flat + subdirectories)
+crates/agent/src/
+├── agent.rs                         # crate root
+├── db.rs                            # sibling module
+├── thread.rs                        # sibling module
+├── thread_store.rs                  # sibling module
+├── tools.rs                         # declares tools/ sub-modules
+├── tools/                           # subdirectory for logical grouping
+│   ├── create_file.rs
+│   ├── edit_file.rs
+│   └── ...
+├── edit_agent.rs                    # declares edit_agent/ sub-modules
+├── edit_agent/                      # subdirectory
+│   ├── inline_diff.rs
+│   └── ...
+└── tests/                           # test subdirectory
+    └── ...
+```
+
+### Rule 4: Tests location
+
+Tests live in one of two places (never at crate root `tests/`):
+- **`src/tests/` subdirectory** — for large test suites (e.g., `agent/src/tests/`)
+- **Inline `#[cfg(test)]` modules** — for unit tests within implementation files
+
+### Applying these rules to our 3 new crates
+
+Below is the complete folder structure for the database crates, following
+every convention.
+
+```
+crates/
+├── database_core/
+│   ├── Cargo.toml                           # [lib] path = "src/database_core.rs"
+│   └── src/
+│       ├── database_core.rs                 # Crate root: mod declarations, re-exports
+│       ├── driver.rs                        # DatabaseDriver + DatabaseConnection traits
+│       ├── schema.rs                        # Schema types (Table, Column, FK, Index)
+│       ├── query_executor.rs                # Async query execution with cancellation
+│       ├── introspection.rs                 # Multi-level metadata loading with cache
+│       ├── connection_pool.rs               # Connection pooling and watchdog
+│       ├── history.rs                       # Query history per connection
+│       ├── data_edit_history.rs             # Undo/redo stack for data modifications
+│       ├── ssh_tunnel.rs                    # SSH tunnel support
+│       ├── errors.rs                        # DatabaseError types
+│       ├── drivers.rs                       # Declares drivers/ sub-modules
+│       ├── drivers/
+│       │   ├── sqlite.rs                    # SQLite implementation
+│       │   ├── postgres.rs                  # PostgreSQL implementation
+│       │   ├── mysql.rs                     # MySQL / MariaDB implementation
+│       │   ├── mssql.rs                     # MS SQL Server implementation
+│       │   └── duckdb.rs                    # DuckDB implementation
+│       └── tests/
+│           ├── driver_tests.rs
+│           ├── introspection_tests.rs
+│           └── query_executor_tests.rs
+│
+├── database_ui/
+│   ├── Cargo.toml                           # [lib] path = "src/database_ui.rs"
+│   └── src/
+│       ├── database_ui.rs                   # Crate root: panel registration, mod declarations
+│       ├── connection_manager.rs            # Entity<ConnectionManager>
+│       ├── connection_dialog.rs             # Connection configuration modal
+│       ├── database_explorer.rs             # Tree panel (Entity<DatabaseExplorer>)
+│       ├── query_editor.rs                  # Specialized SQL buffer
+│       ├── result_grid.rs                   # Extended DataTable for query results
+│       ├── value_editor.rs                  # Side panel for cell editing
+│       ├── record_view.rs                   # Single-row vertical view
+│       ├── aggregate_view.rs               # Multi-cell aggregation panel
+│       ├── quick_actions_toolbar.rs         # Floating context toolbar on cell selection
+│       ├── export.rs                        # Multi-format export
+│       ├── import.rs                        # CSV/clipboard import wizard
+│       ├── table_designer.rs               # GUI dialog for CREATE/ALTER TABLE
+│       ├── explain_plan_viewer.rs           # Execution plan diagram
+│       ├── er_diagram.rs                    # Entity-relationship diagram viewer
+│       ├── diff.rs                          # Declares diff/ sub-modules
+│       ├── diff/
+│       │   ├── data_diff.rs                # Data comparison viewer
+│       │   └── schema_diff.rs              # Schema comparison + migration DDL
+│       └── tests/
+│           ├── grid_tests.rs
+│           ├── explorer_tests.rs
+│           └── export_tests.rs
+│
+├── database_ai/
+│   ├── Cargo.toml                           # [lib] path = "src/database_ai.rs"
+│   └── src/
+│       ├── database_ai.rs                   # Crate root: mod declarations, tool registration
+│       ├── schema_context.rs               # Provide schema context to AI
+│       ├── mention_provider.rs             # @db:, @table:, @schema: mentions
+│       ├── slash_commands.rs               # /db-schema, /db-query, /db-explain
+│       ├── query_generator.rs              # Natural language to SQL
+│       ├── query_optimizer.rs              # AI-powered query optimization
+│       ├── plan_analyzer.rs               # Execution plan analysis
+│       ├── autonomous_agent.rs            # Multi-step autonomous agent with allowlist
+│       ├── mcp_server.rs                  # MCP server exposing DB resources/tools
+│       ├── tools.rs                        # Declares tools/ sub-modules
+│       ├── tools/
+│       │   ├── execute_query.rs           # AgentTool: execute_query
+│       │   ├── describe_object.rs         # AgentTool: describe_database_object
+│       │   ├── list_objects.rs            # AgentTool: list_database_objects
+│       │   ├── explain_query.rs           # AgentTool: explain_query
+│       │   └── modify_data.rs             # AgentTool: modify_data
+│       └── tests/
+│           ├── tool_tests.rs
+│           └── mention_tests.rs
+```
+
+### Crate root file template
+
+Each crate root file follows this pattern:
+
+```rust
+// crates/database_core/src/database_core.rs
+
+mod connection_pool;
+mod data_edit_history;
+mod driver;
+mod drivers;
+mod errors;
+mod history;
+mod introspection;
+mod query_executor;
+mod schema;
+mod ssh_tunnel;
+
+pub use driver::{DatabaseConnection, DatabaseDriver};
+pub use errors::DatabaseError;
+pub use schema::*;
+
+// Re-export drivers
+pub use drivers::{mysql, postgres, sqlite};
+```
+
+### Subdirectory module file template
+
+```rust
+// crates/database_core/src/drivers.rs
+// Sibling .rs file for the drivers/ directory — declares sub-modules
+
+mod duckdb;
+mod mssql;
+mod mysql;
+mod postgres;
+mod sqlite;
+
+pub use mysql::MysqlDriver;
+pub use postgres::PostgresDriver;
+pub use sqlite::SqliteDriver;
+```
+
+### Cargo workspace registration
+
+Each new crate must be added to the workspace root `Cargo.toml`:
+
+```toml
+# /Cargo.toml (workspace root)
+[workspace]
+members = [
+    # ... existing crates ...
+    "crates/database_core",
+    "crates/database_ui",
+    "crates/database_ai",
+]
+```
+
+And the dependency graph between them:
+
+```toml
+# crates/database_ui/Cargo.toml
+[dependencies]
+database_core = { path = "../database_core" }
+gpui = { path = "../gpui" }
+ui = { path = "../ui" }
+workspace = { path = "../workspace" }
+settings = { path = "../settings" }
+db = { path = "../db" }
+
+# crates/database_ai/Cargo.toml
+[dependencies]
+database_core = { path = "../database_core" }
+agent = { path = "../agent" }
+context_server = { path = "../context_server" }
 ```
 
 ---
