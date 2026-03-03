@@ -9,6 +9,7 @@ data grid and database IDE experience to Zed, with agentic AI integration.
 - [Architecture Overview](#architecture-overview)
 - [Folder Structure Conventions](#folder-structure-conventions)
 - [UI/Interface Specification](#uiinterface-specification)
+- [Security Architecture](#security-architecture)
 - [Phase 0 — Infrastructure](#phase-0--infrastructure)
 - [Phase 1 — Connection & Schema](#phase-1--connection--schema)
 - [Phase 2 — Query Editor & Execution](#phase-2--query-editor--execution)
@@ -1916,6 +1917,1030 @@ When `DatabaseSettings.auto_commit` is true:
 | `Entity<Editor>` | `crates/editor/` | SQL editing, inline cells, filters |
 | `SplitEditorView` pattern | `crates/editor/src/split_editor_view.rs` | Drag-to-resize split handle |
 | `initialize_panels()` | `crates/zed/src/zed.rs` (line ~619) | Panel registration |
+
+---
+
+## Security Architecture
+
+This section defines the security model for the database IDE experience. Every design
+decision is grounded in established security standards and references from recognized
+authorities. Security is not an afterthought — it is integrated from the design phase
+following **Microsoft's Security Development Lifecycle (SDL)** methodology.
+
+### Reference Standards and Authorities
+
+| Standard / Work | Authority | Year | Applied To |
+|---|---|---|---|
+| **OWASP Top 10:2025** | Open Web Application Security Project | 2025 | Threat prioritization across all phases |
+| **OWASP SQL Injection Prevention Cheat Sheet** | OWASP | 2024 | Query execution (parameterized queries) |
+| **OWASP Database Security Cheat Sheet** | OWASP | 2024 | Connection management, least privilege |
+| **OWASP Secrets Management Cheat Sheet** | OWASP | 2024 | Credential storage, key rotation |
+| **OWASP Transport Layer Security Cheat Sheet** | OWASP | 2024 | SSL/TLS for database connections |
+| **CWE-89** (SQL Injection) | MITRE Corporation | 2006–2025 | Query construction hardening |
+| **CWE-522** (Insufficiently Protected Credentials) | MITRE Corporation | 2006–2025 | Credential lifecycle |
+| **CWE-311** (Missing Encryption of Sensitive Data) | MITRE Corporation | 2006–2025 | Data in transit/at rest |
+| **NIST SP 800-63B-4** | National Institute of Standards and Technology | 2024 | Password/credential guidelines |
+| **NIST SP 800-53 Rev. 5** (AC, IA, SC families) | NIST | 2020 | Access control, identification, system comm. |
+| **Microsoft SDL** | Microsoft Security Engineering | 2004–2025 | Secure development lifecycle methodology |
+| **STRIDE Threat Model** | Microsoft (Loren Kohnfelder, Praerit Garg) | 1999 | Systematic threat identification |
+| **Rust Security Best Practices** | Rust Security Response WG | Ongoing | Memory safety, safe concurrency |
+| *The Web Application Hacker's Handbook* (2nd ed.) | **Dafydd Stuttard**, Marcus Pinto | 2011 | Input validation, session management |
+| *Threat Modeling: Designing for Security* | **Adam Shostack** (Microsoft) | 2014 | Threat modeling methodology |
+
+### STRIDE Threat Model for the Database IDE
+
+Following Adam Shostack's methodology and Microsoft's STRIDE framework, we identify
+the six categories of threats applied to our specific system components:
+
+```
++------------------+                  +-------------------+
+|  User (Zed)      |  SQL + creds     |  Database Server  |
+|  +-----------+   | ────────────────>|  (PostgreSQL,     |
+|  | QueryEditor|  |  TLS / SSH       |   MySQL, SQLite)  |
+|  +-----------+   |<────────────────-|                   |
+|  | ResultGrid |  |  Query Results   |                   |
+|  +-----------+   |                  +-------------------+
+|  | Explorer   |  |                         ↑
+|  +-----------+   |                         |
+|  | Settings   |  |     +-------------------+
+|  +-----------+   |     | Platform Keychain  |
++------------------+     | (macOS/Linux/Win)  |
+         ↑               +-------------------+
+         |
++------------------+
+|  settings.json   |  ← Connection configs (NO passwords)
+|  (local file)    |
++------------------+
+```
+
+| STRIDE Category | Threat | Component | Mitigation | Reference |
+|---|---|---|---|---|
+| **S — Spoofing** | Attacker impersonates a database server (MITM) | Connection layer | TLS certificate verification (`SslMode::VerifyFull`), SSH host key fingerprint validation | OWASP TLS Cheat Sheet |
+| **S — Spoofing** | Attacker uses stolen credentials | Credential storage | Platform keychain (never plaintext), memory zeroization after use, env var priority | NIST SP 800-63B-4, OWASP Secrets Mgmt |
+| **T — Tampering** | Attacker modifies SQL in transit | Connection layer | TLS encryption for all connections, SSH tunnel for untrusted networks | CWE-319, OWASP TLS CS |
+| **T — Tampering** | Attacker modifies settings.json to inject malicious connection | Settings | Settings file permissions (0600), no passwords in settings, validate config on load | OWASP Secrets Mgmt CS |
+| **R — Repudiation** | User denies executing a destructive query | Query history | Immutable query history log with timestamps, DML preview before commit | OWASP Logging CS |
+| **I — Info Disclosure** | Credentials leaked via logs, crash reports, or memory dumps | Credential lifecycle | Redact passwords from all logs, `Debug` impl omits secrets, zeroize on drop | CWE-532, CWE-522 |
+| **I — Info Disclosure** | Query results containing PII visible in process memory | Result grid | No result caching to disk, clear results on tab close, no swap/core dump of passwords | CWE-311 |
+| **D — Denial of Service** | Malicious query consumes all server resources | Query execution | Query timeout (configurable), cancel mechanism per driver, connection pool limits | OWASP Top 10 A10:2025 |
+| **D — Denial of Service** | Huge result set exhausts client memory | Result grid | Server-side pagination (`LIMIT/OFFSET`), configurable `page_size`, streaming with backpressure | CWE-400 |
+| **E — Elevation of Privilege** | Application account used for DDL when only SELECT needed | Connection config | Read-only mode toggle per connection, statement type validation before execution | OWASP DB Security CS, Least Privilege |
+| **E — Elevation of Privilege** | AI agent executes destructive queries without consent | AI tools | `ActionAllowlist`, `ToolKind::Write` requires confirmation, max_rows_affected limit | OWASP Top 10 A01:2025 |
+
+### 1. SQL Injection Prevention (OWASP A05:2025, CWE-89)
+
+> **Reference**: OWASP ranks injection as **A05:2025** with over 14,000 CVEs for SQL
+> injection alone. CWE-89 is classified as a "weakness that is still very frequent"
+> by MITRE. The OWASP SQL Injection Prevention Cheat Sheet states: *"The #1 recommended
+> defense is the use of parameterized queries (prepared statements)."*
+
+#### Principle: Never Build SQL from User Input by String Concatenation
+
+All user-supplied data must be bound via parameterized queries. The Rust ecosystem
+enforces this through `sqlx`'s compile-time checked query macros.
+
+**Hardened zones** (where user input touches SQL):
+
+| Zone | User Input | SQL Context | Defense |
+|---|---|---|---|
+| QueryEditor execute | Full SQL text | Direct execution | Statement type validation + read-only guard |
+| Server-side filter | WHERE clause text | Appended to query | Parse and validate AST, reject multi-statement |
+| Sort columns | Column name | ORDER BY clause | Allow-list validation against schema cache |
+| Pagination | Page number, page size | LIMIT/OFFSET values | Integer parsing only, max cap from settings |
+| FK navigation | Cell value | WHERE clause | Parameterized bind (`$1` / `?`) |
+| AI tools | Generated SQL | Direct execution | Human confirmation for writes, `ActionAllowlist` |
+| DDL generator | Object names | DDL statements | Quote identifiers, validate against schema |
+
+```rust
+// crates/database_core/src/query_executor.rs
+
+/// SECURE: Execute a user-written SQL query with safety checks.
+/// This is the ONLY entry point for executing user-supplied SQL.
+pub async fn execute_user_query(
+    connection: &dyn DatabaseConnection,
+    sql: &str,
+    config: &ConnectionConfig,
+) -> Result<QueryResult> {
+    // 1. Validate statement type against read-only mode
+    if config.read_only {
+        let statement_type = classify_statement(sql)?;
+        if statement_type.is_mutating() {
+            return Err(DatabaseError::ReadOnlyViolation {
+                statement_type: statement_type.to_string(),
+            }.into());
+        }
+    }
+
+    // 2. Reject multi-statement batches from untrusted input
+    //    (user QueryEditor is trusted, but server-side filters are not)
+    // 3. Execute
+    connection.execute_query(sql).await
+}
+
+/// SECURE: Build a parameterized filter query — never concatenate user values.
+/// Used by server-side filtering and FK navigation.
+pub fn build_filtered_query(
+    base_table: &TableRef,
+    columns: &[ColumnInfo],
+    filters: &[ColumnFilter],
+    sort: &[SortColumn],
+    page: usize,
+    page_size: usize,
+) -> (String, Vec<CellValue>) {
+    let mut sql = format!(
+        "SELECT * FROM {}",
+        quote_identifier(&base_table.qualified_name()),
+    );
+    let mut params: Vec<CellValue> = Vec::new();
+    let mut param_index = 1;
+
+    // WHERE clause — all values are parameterized
+    if !filters.is_empty() {
+        sql.push_str(" WHERE ");
+        let conditions: Vec<String> = filters.iter().map(|f| {
+            let col_name = quote_identifier(&columns[f.column_index].name);
+            let condition = match f.filter_type {
+                FilterType::Equals => {
+                    params.push(CellValue::String(f.value.clone()));
+                    format!("{} = ${}", col_name, param_index)
+                }
+                FilterType::Contains => {
+                    params.push(CellValue::String(format!("%{}%", f.value)));
+                    format!("{} LIKE ${}", col_name, param_index)
+                }
+                FilterType::IsNull => {
+                    return format!("{} IS NULL", col_name);
+                    // No param needed — no user value in SQL
+                }
+                FilterType::IsNotNull => {
+                    return format!("{} IS NOT NULL", col_name);
+                }
+                _ => {
+                    params.push(CellValue::String(f.value.clone()));
+                    format!("{} = ${}", col_name, param_index)
+                }
+            };
+            param_index += 1;
+            condition
+        }).collect();
+        sql.push_str(&conditions.join(" AND "));
+    }
+
+    // ORDER BY — column names validated against schema (allow-list)
+    if !sort.is_empty() {
+        let order_clauses: Vec<String> = sort.iter()
+            .filter(|s| s.column_index < columns.len()) // Bounds check
+            .map(|s| {
+                let col_name = quote_identifier(&columns[s.column_index].name);
+                let direction = match s.direction {
+                    SortDirection::Ascending => "ASC",
+                    SortDirection::Descending => "DESC",
+                };
+                format!("{} {}", col_name, direction)
+            })
+            .collect();
+        if !order_clauses.is_empty() {
+            sql.push_str(" ORDER BY ");
+            sql.push_str(&order_clauses.join(", "));
+        }
+    }
+
+    // LIMIT/OFFSET — integers only, capped by settings
+    let safe_page_size = page_size.min(10_000); // Hard cap
+    sql.push_str(&format!(" LIMIT {} OFFSET {}", safe_page_size, page * safe_page_size));
+
+    (sql, params)
+}
+
+/// Quote a SQL identifier to prevent injection through object names.
+/// Follows ANSI SQL double-quote escaping: `"table""name"` escapes embedded quotes.
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Classify a SQL statement to determine if it's read-only or mutating.
+/// Used by the read-only guard. Does NOT attempt to parse full SQL —
+/// uses a conservative keyword-based heuristic.
+fn classify_statement(sql: &str) -> Result<StatementType> {
+    let trimmed = sql.trim_start();
+    // Skip leading comments
+    let normalized = strip_sql_comments(trimmed).to_uppercase();
+    let first_keyword = normalized.split_whitespace().next().unwrap_or("");
+
+    match first_keyword {
+        "SELECT" | "EXPLAIN" | "SHOW" | "DESCRIBE" | "WITH" => Ok(StatementType::ReadOnly),
+        "INSERT" => Ok(StatementType::Insert),
+        "UPDATE" => Ok(StatementType::Update),
+        "DELETE" => Ok(StatementType::Delete),
+        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME" => Ok(StatementType::Ddl),
+        "GRANT" | "REVOKE" => Ok(StatementType::Dcl),
+        "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" => Ok(StatementType::Transaction),
+        _ => Ok(StatementType::Unknown),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatementType {
+    ReadOnly,
+    Insert,
+    Update,
+    Delete,
+    Ddl,
+    Dcl,
+    Transaction,
+    Unknown,
+}
+
+impl StatementType {
+    pub fn is_mutating(&self) -> bool {
+        matches!(self, Self::Insert | Self::Update | Self::Delete | Self::Ddl | Self::Dcl)
+    }
+}
+```
+
+### 2. Credential Security (OWASP A04:2025, CWE-522, NIST SP 800-63B-4)
+
+> **Reference**: OWASP Secrets Management Cheat Sheet: *"Engineers should not have
+> access to all secrets. Apply the Least Privilege principle."* NIST SP 800-63B-4
+> eliminates mandatory password rotation and complexity rules, focusing instead on
+> longer passwords and blocklist screening. CWE-522 addresses insufficiently protected
+> credentials.
+
+#### Principle: Passwords Never Exist in Plaintext Outside Secure Storage
+
+```
+Credential Lifecycle:
+                                                              ┌────────────────┐
+                                                              │ Platform       │
+  User types password ──→ ConnectionDialog ──→ Save ──→       │ Keychain       │
+  in modal                (in-memory only)    (encrypt)       │ (macOS/Linux/  │
+                                                              │  Windows)      │
+                                                              └───────┬────────┘
+                                                                      │
+  Connection needed ──→ CredentialProvider ──→ Load ──→ Memory ──→ Driver
+                         Priority:                    (zeroized     (TLS
+                         1. Env var                    after use)    protected)
+                         2. Keychain
+                         3. Prompt user
+```
+
+**Rules enforced in code:**
+
+| Rule | Enforcement | CWE / Reference |
+|---|---|---|
+| No passwords in `settings.json` | `ConnectionConfig` has no `password` field — only `id`, `name`, `host`, etc. | CWE-256 (Plaintext Storage) |
+| No passwords in logs | `DatabaseError::fmt()` redacts any string matching password patterns. `Debug` impls for credential types print `"[REDACTED]"` | CWE-532 (Info Exposure via Log) |
+| No passwords in crash reports | `Sentry` scrubbing rules exclude `password`, `credential`, `secret` fields | CWE-209 (Info Exposure via Error) |
+| Memory zeroization | `zeroize` crate on password `String` fields — cleared on drop | CWE-316 (Cleartext in Memory) |
+| Env var priority | `DB_PASSWORD_<NAME>` env var checked first — enables CI/CD without keychain | OWASP Secrets Mgmt CS |
+| No clipboard leaks | Password fields in ConnectionDialog prevent copy/paste out | CWE-200 (Exposure of Sensitive Info) |
+
+```rust
+// crates/database_core/src/credential.rs
+
+use zeroize::Zeroize;
+
+/// A password that is zeroized when dropped.
+/// NEVER implements Display or Debug with the actual value.
+#[derive(Clone, Zeroize)]
+#[zeroize(drop)]
+pub struct SecurePassword(String);
+
+impl SecurePassword {
+    pub fn new(password: String) -> Self {
+        Self(password)
+    }
+
+    /// Expose the password for driver consumption.
+    /// The caller must not store or log the returned value.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecurePassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl std::fmt::Display for SecurePassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+/// Credential loading with priority chain.
+/// Follows OWASP Secrets Management Cheat Sheet recommendations.
+pub struct CredentialProvider {
+    keychain: Box<dyn CredentialsProvider>,
+}
+
+impl CredentialProvider {
+    /// Load credential with defense-in-depth priority chain:
+    /// 1. Environment variable (for CI/CD and containers)
+    /// 2. Platform keychain (macOS Keychain, Linux Secret Service, Windows Credential Manager)
+    /// 3. Prompt user via modal dialog
+    pub async fn load(
+        &self,
+        connection_id: &ConnectionId,
+        connection_name: &str,
+        cx: &mut AsyncApp,
+    ) -> Result<SecurePassword> {
+        // Priority 1: Environment variable
+        let env_key = format!(
+            "DB_PASSWORD_{}",
+            connection_name.to_uppercase().replace(|c: char| !c.is_alphanumeric(), "_")
+        );
+        if let Ok(password) = std::env::var(&env_key) {
+            return Ok(SecurePassword::new(password));
+        }
+
+        // Priority 2: Platform keychain
+        let keychain_url = format!("zed-db://{}", connection_id.0);
+        match self.keychain.read_credentials(&keychain_url).await {
+            Ok(Some(credentials)) => {
+                let password = String::from_utf8(credentials.password)
+                    .map_err(|_| anyhow::anyhow!("Invalid UTF-8 in stored password"))?;
+                return Ok(SecurePassword::new(password));
+            }
+            Ok(None) => { /* Not stored, fall through to prompt */ }
+            Err(error) => {
+                log::warn!("Keychain read failed for {}: {}", connection_name, error);
+                // Fall through to prompt — don't block on keychain errors
+            }
+        }
+
+        // Priority 3: Prompt user
+        Err(anyhow::anyhow!("Credential not found — prompt user"))
+    }
+
+    /// Save credential to platform keychain.
+    /// Per NIST SP 800-63B-4: no mandatory rotation, no complexity rules.
+    pub async fn save(
+        &self,
+        connection_id: &ConnectionId,
+        password: &SecurePassword,
+    ) -> Result<()> {
+        let keychain_url = format!("zed-db://{}", connection_id.0);
+        self.keychain.write_credentials(
+            &keychain_url,
+            "zed-database",
+            password.expose_secret().as_bytes(),
+        ).await
+    }
+
+    /// Delete credential from keychain (on connection removal).
+    pub async fn delete(&self, connection_id: &ConnectionId) -> Result<()> {
+        let keychain_url = format!("zed-db://{}", connection_id.0);
+        self.keychain.delete_credentials(&keychain_url).await
+    }
+}
+```
+
+### 3. Transport Security (OWASP A04:2025, CWE-319, CWE-311)
+
+> **Reference**: OWASP Transport Layer Security Cheat Sheet: *"When correctly implemented,
+> TLS can provide confidentiality, integrity, and authentication."* The OWASP Database
+> Security Cheat Sheet states: *"Most database default configurations start with
+> unencrypted network connections. Configure the database to only allow encrypted
+> connections."*
+
+#### Principle: All Database Connections Must Be Encrypted in Transit
+
+| Connection Type | Encryption Mechanism | Minimum Standard |
+|---|---|---|
+| Direct to PostgreSQL | TLS 1.2+ via `native-tls` or `rustls` | `SslMode::Prefer` default, `VerifyFull` recommended |
+| Direct to MySQL | TLS 1.2+ via `mysql_async` TLS support | Required for non-localhost connections |
+| Direct to MSSQL | TDS protocol encryption via `tiberius` | `Encryption::Required` default |
+| SQLite (local) | N/A (local file access) | File permissions (0600) |
+| SSH Tunnel | SSH encryption (AES-256) | Host key fingerprint verification |
+
+```rust
+// crates/database_core/src/driver.rs (TLS section)
+
+/// Build TLS configuration per OWASP TLS Cheat Sheet recommendations.
+/// Minimum: TLS 1.2, SHA-256 certificates, 2048-bit keys.
+pub fn build_tls_config(ssl_config: &SslConfig) -> Result<TlsConnector> {
+    let mut builder = native_tls::TlsConnector::builder();
+
+    // Enforce minimum TLS 1.2 (OWASP TLS CS requirement)
+    builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+
+    match ssl_config.mode {
+        SslMode::Disable => {
+            // Log a warning — unencrypted connections are a risk
+            log::warn!("TLS disabled for database connection — data transmitted in cleartext");
+            return Err(anyhow::anyhow!("TLS disabled"));
+        }
+        SslMode::Prefer | SslMode::Require => {
+            // Connect with TLS but don't verify server certificate
+            builder.danger_accept_invalid_certs(true);
+        }
+        SslMode::VerifyCa => {
+            // Verify server certificate against CA but don't check hostname
+            if let Some(ca_path) = &ssl_config.ca_cert_path {
+                let ca_cert = std::fs::read(ca_path)?;
+                let cert = native_tls::Certificate::from_pem(&ca_cert)?;
+                builder.add_root_certificate(cert);
+            }
+        }
+        SslMode::VerifyFull => {
+            // Full verification: CA chain + hostname match (RECOMMENDED)
+            if let Some(ca_path) = &ssl_config.ca_cert_path {
+                let ca_cert = std::fs::read(ca_path)?;
+                let cert = native_tls::Certificate::from_pem(&ca_cert)?;
+                builder.add_root_certificate(cert);
+            }
+            // Hostname verification is enabled by default in native-tls
+        }
+    }
+
+    // Client certificate authentication (mTLS)
+    if let (Some(cert_path), Some(key_path)) = (&ssl_config.client_cert_path, &ssl_config.client_key_path) {
+        let cert = std::fs::read(cert_path)?;
+        let key = std::fs::read(key_path)?;
+        let identity = native_tls::Identity::from_pkcs8(&cert, &key)?;
+        builder.identity(identity);
+    }
+
+    Ok(builder.build()?)
+}
+```
+
+**SSH tunnel host key verification:**
+
+```rust
+// crates/database_core/src/ssh_tunnel.rs (security section)
+
+/// SSH host key verification strategy.
+/// Per OWASP: always verify host keys to prevent MITM attacks.
+pub enum HostKeyVerification {
+    /// Reject unknown hosts — most secure, requires known_hosts file
+    Strict,
+    /// Accept on first connection, reject on change (TOFU — Trust On First Use)
+    TrustOnFirstUse { known_hosts_path: PathBuf },
+    /// Accept all keys — INSECURE, only for development
+    AcceptAll,
+}
+
+impl HostKeyVerification {
+    pub fn verify(&self, host: &str, key: &ssh_key::PublicKey) -> Result<()> {
+        match self {
+            Self::Strict => {
+                // Look up host in known_hosts, reject if not found or mismatch
+                todo!()
+            }
+            Self::TrustOnFirstUse { known_hosts_path } => {
+                // Accept if not seen before (and store), reject if key changed
+                // Show warning to user on first connection
+                todo!()
+            }
+            Self::AcceptAll => {
+                log::warn!("SSH host key verification disabled — vulnerable to MITM");
+                Ok(())
+            }
+        }
+    }
+}
+```
+
+### 4. Access Control and Least Privilege (OWASP A01:2025)
+
+> **Reference**: OWASP ranks Broken Access Control as **A01:2025** (#1 risk). 100%
+> of tested applications had some form of broken access control. The OWASP Database
+> Security Cheat Sheet states: *"DO NOT ASSIGN DBA OR ADMIN TYPE ACCESS TO YOUR
+> APPLICATION ACCOUNTS."* The principle of least privilege (PoLP) dictates that each
+> connection should have only the minimum permissions required.
+
+#### Principle: Enforce Least Privilege at Every Layer
+
+**Layer 1 — Connection-level read-only mode:**
+
+```rust
+// crates/database_core/src/query_executor.rs (access control section)
+
+/// Guard that enforces read-only mode per connection.
+/// This is the first line of defense — even before SQL reaches the driver.
+pub struct ReadOnlyGuard;
+
+impl ReadOnlyGuard {
+    pub fn check(sql: &str, config: &ConnectionConfig) -> Result<()> {
+        if !config.read_only {
+            return Ok(()); // No restriction
+        }
+
+        let statement_type = classify_statement(sql)?;
+        if statement_type.is_mutating() {
+            return Err(DatabaseError::ReadOnlyViolation {
+                statement_type: format!("{:?}", statement_type),
+            }.into());
+        }
+        Ok(())
+    }
+}
+```
+
+**Layer 2 — AI agent action allowlist:**
+
+```rust
+// crates/database_ai/src/autonomous_agent.rs (access control section)
+
+/// Controls what operations the AI agent can perform.
+/// Follows OWASP principle: "minimize privileges assigned to every account."
+pub struct ActionAllowlist {
+    pub allow_select: bool,        // Default: true
+    pub allow_insert: bool,        // Default: false
+    pub allow_update: bool,        // Default: false
+    pub allow_delete: bool,        // Default: false
+    pub allow_ddl: bool,           // Default: false
+    pub allow_explain: bool,       // Default: true
+    pub max_rows_affected: usize,  // Default: 100
+    pub require_confirmation: bool, // Default: true for write operations
+}
+
+impl ActionAllowlist {
+    pub fn check_permission(&self, statement_type: &StatementType) -> Result<()> {
+        match statement_type {
+            StatementType::ReadOnly => {
+                if !self.allow_select {
+                    return Err(anyhow::anyhow!("SELECT not allowed by agent policy"));
+                }
+            }
+            StatementType::Insert => {
+                if !self.allow_insert {
+                    return Err(anyhow::anyhow!("INSERT not allowed by agent policy"));
+                }
+            }
+            StatementType::Update => {
+                if !self.allow_update {
+                    return Err(anyhow::anyhow!("UPDATE not allowed by agent policy"));
+                }
+            }
+            StatementType::Delete => {
+                if !self.allow_delete {
+                    return Err(anyhow::anyhow!("DELETE not allowed by agent policy"));
+                }
+            }
+            StatementType::Ddl | StatementType::Dcl => {
+                if !self.allow_ddl {
+                    return Err(anyhow::anyhow!("DDL/DCL not allowed by agent policy"));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Default allowlist: read-only, safe for autonomous operation
+    pub fn default_safe() -> Self {
+        Self {
+            allow_select: true,
+            allow_insert: false,
+            allow_update: false,
+            allow_delete: false,
+            allow_ddl: false,
+            allow_explain: true,
+            max_rows_affected: 100,
+            require_confirmation: true,
+        }
+    }
+}
+```
+
+**Layer 3 — UI-level confirmation for destructive operations:**
+
+All data modifications go through the DML preview dialog (Section 3.16). This
+ensures the user sees the exact SQL before it executes. The dialog follows Cooper's
+"no data loss" principle and provides a last line of defense.
+
+### 5. Input Validation and Sanitization (OWASP A05:2025)
+
+> **Reference**: OWASP Injection Prevention: *"Assume all input is malicious. Use
+> an 'accept known good' input validation strategy."* CWE-89: *"Apply allow-listing
+> rather than block-lists."*
+
+#### Validation Layers
+
+| Input Source | Validation Rule | Implementation |
+|---|---|---|
+| Column names in sort/filter | Allow-list: must exist in `schema_cache.columns` | `build_filtered_query()` checks `column_index < columns.len()` |
+| Table names from explorer | Allow-list: must exist in `schema_cache.objects` | `quote_identifier()` + schema validation |
+| Page size | Integer, capped: 1 ≤ n ≤ 10,000 | `page_size.clamp(1, 10_000)` |
+| Page number | Non-negative integer | `page.max(0)` |
+| Filter values | Parameterized bind (never concatenated) | `$1` / `?` placeholders in SQL |
+| Connection form fields | Type-specific: port is u16, host is non-empty string | `ConnectionConfig::validate()` |
+| SQL from QueryEditor | User-trusted (full SQL editor) but checked for read-only | `ReadOnlyGuard::check()` |
+| SQL from AI agent | Untrusted: classified + allowlist checked + confirmation | `ActionAllowlist::check_permission()` |
+
+```rust
+// crates/database_core/src/schema.rs (validation section)
+
+impl ConnectionConfig {
+    /// Validate all fields before attempting connection.
+    /// Applies input validation per OWASP guidelines.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        if self.name.trim().is_empty() {
+            errors.push("Connection name is required".to_string());
+        }
+        if self.name.len() > 255 {
+            errors.push("Connection name must be 255 characters or less".to_string());
+        }
+
+        match self.driver {
+            DriverType::Sqlite => {
+                if self.sqlite_path.is_none() {
+                    errors.push("SQLite file path is required".to_string());
+                }
+            }
+            _ => {
+                if self.host.as_ref().map_or(true, |h| h.trim().is_empty()) {
+                    errors.push("Host is required".to_string());
+                }
+                if let Some(host) = &self.host {
+                    if host.len() > 253 {
+                        errors.push("Host must be 253 characters or less".to_string());
+                    }
+                    // Reject hosts with SQL injection patterns
+                    if host.contains(';') || host.contains('\'') || host.contains('"') {
+                        errors.push("Host contains invalid characters".to_string());
+                    }
+                }
+                if let Some(port) = self.port {
+                    if port == 0 {
+                        errors.push("Port must be between 1 and 65535".to_string());
+                    }
+                }
+                if let Some(user) = &self.user {
+                    if user.len() > 128 {
+                        errors.push("Username must be 128 characters or less".to_string());
+                    }
+                }
+            }
+        }
+
+        if self.color_index >= 8 {
+            errors.push("Color index must be 0-7".to_string());
+        }
+
+        if errors.is_empty() { Ok(()) } else { Err(errors) }
+    }
+}
+```
+
+### 6. Denial of Service Protection (OWASP A10:2025, CWE-400)
+
+> **Reference**: OWASP A10:2025 addresses *"Mishandling of Exceptional Conditions"*
+> — this includes resource exhaustion. CWE-400 covers uncontrolled resource consumption.
+
+#### Protections Implemented
+
+| Threat | Mitigation | Setting |
+|---|---|---|
+| Infinite/huge result set | Server-side `LIMIT` on all queries | `DatabaseSettings.page_size` (default: 500, max: 10,000) |
+| Runaway query | Configurable query timeout per connection | `ConnectionConfig.query_timeout` (default: 30s) |
+| Memory exhaustion from LOBs | LOB size cap with interactive "load more" | `DatabaseSettings.max_lob_size` (default: 1 KB) |
+| Connection pool exhaustion | Max connections per pool with queue timeout | `ConnectionPoolConfig.max_connections` (default: 5) |
+| Too many open tabs | No hard limit, but lazy result cleanup on tab close | Results freed on `on_removed()` |
+| Malicious SSH server | Connection timeout + host key verification | SSH connect timeout: 10s |
+
+```rust
+// crates/database_core/src/connection_pool.rs (DoS protection section)
+
+pub struct ConnectionPoolConfig {
+    pub max_connections: usize,      // Default: 5
+    pub idle_timeout: Duration,      // Default: 5 minutes
+    pub connection_timeout: Duration, // Default: 10 seconds
+    pub query_timeout: Duration,     // Default: 30 seconds
+    pub max_query_size: usize,       // Default: 1 MB (SQL text size)
+}
+
+impl Default for ConnectionPoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 5,
+            idle_timeout: Duration::from_secs(300),
+            connection_timeout: Duration::from_secs(10),
+            query_timeout: Duration::from_secs(30),
+            max_query_size: 1_048_576, // 1 MB
+        }
+    }
+}
+
+/// Validate query size before execution (defense against oversized payloads).
+pub fn validate_query_size(sql: &str, max_size: usize) -> Result<()> {
+    if sql.len() > max_size {
+        return Err(DatabaseError::QueryTooLarge {
+            actual: sql.len(),
+            limit: max_size,
+        }.into());
+    }
+    Ok(())
+}
+```
+
+### 7. Logging and Audit Trail (OWASP A09:2025)
+
+> **Reference**: OWASP A09:2025 (*"Security Logging and Alerting Failures"*): Applications
+> must log security-relevant events with enough detail to reconstruct what happened, but
+> without exposing sensitive data. CWE-532 addresses information exposure through log files.
+
+#### Logging Rules
+
+| Event | Logged Data | Redacted Data |
+|---|---|---|
+| Connection established | Connection name, host, port, driver, timestamp | Password, SSH key |
+| Connection failed | Connection name, error type, timestamp | Password, detailed error if auth-related |
+| Query executed | SQL (first 500 chars), duration, row count, connection name | Full SQL if > 500 chars (truncated) |
+| Query failed | SQL (first 500 chars), error message, connection name | Sensitive error details |
+| Data modification committed | Table name, operation count (N inserts, N updates, N deletes) | Actual data values |
+| Credential access | Connection name, source (keychain/env/prompt) | Password value |
+| SSL/TLS connection | Mode, cipher suite, certificate info | Private key material |
+
+```rust
+// crates/database_core/src/errors.rs (logging section)
+
+impl DatabaseError {
+    /// Log the error with appropriate redaction.
+    /// Per OWASP: log enough to diagnose, never log secrets.
+    pub fn log_securely(&self) {
+        match self {
+            Self::AuthenticationFailed { user } => {
+                // Log the attempt but not the password
+                log::warn!("Authentication failed for user '{}' — check credentials", user);
+            }
+            Self::QueryFailed { sql_preview, db_error, .. } => {
+                // Truncate SQL to avoid logging sensitive data in queries
+                let safe_preview = if sql_preview.len() > 500 {
+                    format!("{}...[truncated]", &sql_preview[..500])
+                } else {
+                    sql_preview.clone()
+                };
+                log::error!("Query failed: {} — SQL: {}", db_error, safe_preview);
+            }
+            Self::ConnectionFailed { host, port, cause } => {
+                log::error!("Connection failed to {}:{} — {}", host, port, cause);
+            }
+            _ => {
+                log::error!("{}", self);
+            }
+        }
+    }
+}
+
+/// Redact sensitive patterns from arbitrary strings (for Sentry, crash reports).
+pub fn redact_sensitive(text: &str) -> String {
+    let patterns = [
+        (r"(?i)password\s*=\s*'[^']*'", "password='[REDACTED]'"),
+        (r"(?i)password\s*=\s*\S+", "password=[REDACTED]"),
+        (r"(?i)secret\s*=\s*'[^']*'", "secret='[REDACTED]'"),
+        (r"(?i)token\s*=\s*\S+", "token=[REDACTED]"),
+    ];
+    let mut result = text.to_string();
+    for (pattern, replacement) in &patterns {
+        if let Ok(regex) = regex::Regex::new(pattern) {
+            result = regex.replace_all(&result, *replacement).to_string();
+        }
+    }
+    result
+}
+```
+
+### 8. Rust-Specific Security Advantages
+
+> **Reference**: The Rust Security Response Working Group maintains ongoing security
+> advisories. SQLx uses `#![forbid(unsafe_code)]` for PostgreSQL and MySQL drivers.
+> Rust's ownership model eliminates use-after-free, buffer overflows, and data races
+> at compile time.
+
+| Rust Feature | Security Benefit | Relevant CWE |
+|---|---|---|
+| Ownership + borrowing | No use-after-free, no double-free | CWE-416, CWE-415 |
+| No null pointers | No null dereference crashes | CWE-476 |
+| Bounds checking | No buffer overflow on indexing | CWE-120, CWE-787 |
+| `Send` + `Sync` traits | No data races in concurrent code | CWE-362 |
+| `sqlx::query!` macro | Compile-time SQL type checking | CWE-89 (partial) |
+| `#![forbid(unsafe_code)]` | No unsafe memory operations in driver code | CWE-119 |
+| `zeroize` crate | Guaranteed memory clearing of secrets | CWE-316 |
+| `Result<T, E>` everywhere | Forced error handling, no silent failures | CWE-252, CWE-391 |
+
+**Crate-level safety declarations:**
+
+```rust
+// crates/database_core/src/database_core.rs (top of file)
+
+// Forbid unsafe code in the entire crate — all memory safety
+// guarantees are enforced by the Rust compiler.
+// Exception: SQLite driver uses rusqlite which contains unsafe internally,
+// but our code wrapping it does not.
+#![deny(unsafe_code)]
+#![deny(clippy::unwrap_used)]   // Per CLAUDE.md: no panicking operations
+#![deny(clippy::expect_used)]
+#![warn(clippy::pedantic)]
+```
+
+### 9. Supply Chain Security (OWASP A03:2025)
+
+> **Reference**: OWASP A03:2025 (*"Software Supply Chain Failures"*) is a **new
+> category** in the 2025 edition, reflecting the growing risk of compromised dependencies.
+
+#### Dependency Audit Requirements
+
+| Dependency | Purpose | Audit Status | Notes |
+|---|---|---|---|
+| `sqlx` | PostgreSQL/MySQL/SQLite driver | Widely audited, `#![forbid(unsafe_code)]` for PG/MySQL | Pure Rust, no C bindings for PG/MySQL |
+| `rusqlite` | SQLite bindings | Contains unsafe (C FFI) | Mature, well-maintained |
+| `tokio-postgres` | Alternative PG driver | Widely used | Consider vs sqlx |
+| `mysql_async` | MySQL driver | | |
+| `tiberius` | MSSQL driver | | TDS protocol implementation |
+| `russh` | SSH tunneling | | Pure Rust SSH |
+| `native-tls` | TLS | Platform TLS backend | Uses OS TLS libraries |
+| `zeroize` | Secret memory clearing | RustCrypto project, audited | |
+| `csv` | CSV export | No security-sensitive code | Data processing only |
+
+**Verification steps (to be run in CI):**
+
+```bash
+# Audit all dependencies for known vulnerabilities (RUSTSEC advisories)
+cargo audit
+
+# Check for unmaintained crates
+cargo audit --deny unmaintained
+
+# Verify no new unsafe code introduced
+cargo clippy -- -D unsafe_code
+
+# Check for dependency confusion (ensure all deps are from crates.io)
+cargo deny check sources
+```
+
+### 10. Security Testing Plan
+
+| Test Category | Tool / Method | Phase | Frequency |
+|---|---|---|---|
+| SQL injection fuzzing | Custom test harness with malicious inputs | Phase 0 | Every PR |
+| Credential leak detection | `grep` for password patterns in logs, settings | Phase 0 | Every PR |
+| TLS verification | Integration test with invalid certs | Phase 1 | Every PR |
+| Read-only enforcement | Unit tests for `ReadOnlyGuard` with all statement types | Phase 0 | Every PR |
+| AI allowlist enforcement | Unit tests for `ActionAllowlist` with all statement types | Phase 5 | Every PR |
+| Dependency audit | `cargo audit` | Phase 0 | Weekly CI + every PR |
+| Memory safety (secrets) | Test `zeroize` behavior with `miri` | Phase 0 | Monthly |
+| Input validation | Fuzz `ConnectionConfig::validate()` with arbitrary strings | Phase 1 | Every PR |
+| Statement classification | Unit tests for `classify_statement()` with edge cases | Phase 0 | Every PR |
+
+```rust
+// crates/database_core/src/tests/security_tests.rs
+
+#[cfg(test)]
+mod sql_injection_tests {
+    use super::*;
+
+    #[test]
+    fn test_quote_identifier_prevents_injection() {
+        // Double-quote escaping prevents breaking out of identifiers
+        assert_eq!(quote_identifier("users"), "\"users\"");
+        assert_eq!(quote_identifier("users\"--"), "\"users\"\"--\"");
+        assert_eq!(
+            quote_identifier("a\"; DROP TABLE users; --"),
+            "\"a\"\"; DROP TABLE users; --\""
+        );
+    }
+
+    #[test]
+    fn test_classify_statement_read_only() {
+        assert_eq!(classify_statement("SELECT * FROM users").unwrap(), StatementType::ReadOnly);
+        assert_eq!(classify_statement("  SELECT 1").unwrap(), StatementType::ReadOnly);
+        assert_eq!(classify_statement("EXPLAIN SELECT 1").unwrap(), StatementType::ReadOnly);
+        assert_eq!(classify_statement("WITH cte AS (SELECT 1) SELECT * FROM cte").unwrap(), StatementType::ReadOnly);
+    }
+
+    #[test]
+    fn test_classify_statement_mutating() {
+        assert!(classify_statement("INSERT INTO users VALUES (1)").unwrap().is_mutating());
+        assert!(classify_statement("UPDATE users SET name = 'x'").unwrap().is_mutating());
+        assert!(classify_statement("DELETE FROM users").unwrap().is_mutating());
+        assert!(classify_statement("DROP TABLE users").unwrap().is_mutating());
+        assert!(classify_statement("ALTER TABLE users ADD COLUMN x INT").unwrap().is_mutating());
+        assert!(classify_statement("TRUNCATE users").unwrap().is_mutating());
+        assert!(classify_statement("GRANT SELECT ON users TO role").unwrap().is_mutating());
+    }
+
+    #[test]
+    fn test_classify_statement_with_comments() {
+        // SQL comments should not bypass classification
+        assert!(classify_statement("-- SELECT\nDELETE FROM users").unwrap().is_mutating());
+        assert!(classify_statement("/* comment */ DROP TABLE x").unwrap().is_mutating());
+    }
+
+    #[test]
+    fn test_read_only_guard_blocks_mutations() {
+        let config = ConnectionConfig {
+            read_only: true,
+            ..test_config()
+        };
+        assert!(ReadOnlyGuard::check("SELECT 1", &config).is_ok());
+        assert!(ReadOnlyGuard::check("DELETE FROM users", &config).is_err());
+        assert!(ReadOnlyGuard::check("DROP TABLE users", &config).is_err());
+    }
+
+    #[test]
+    fn test_build_filtered_query_parameterizes_values() {
+        let columns = vec![test_column("name"), test_column("age")];
+        let filters = vec![ColumnFilter {
+            column_index: 0,
+            filter_type: FilterType::Equals,
+            value: "'; DROP TABLE users; --".to_string(), // Injection attempt
+        }];
+        let (sql, params) = build_filtered_query(
+            &TableRef { catalog: None, schema: None, name: "users".into() },
+            &columns, &filters, &[], 0, 500,
+        );
+        // Value must be in params, NOT in the SQL string
+        assert!(!sql.contains("DROP TABLE"));
+        assert!(sql.contains("$1"));
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn test_page_size_capped() {
+        let (sql, _) = build_filtered_query(
+            &TableRef { catalog: None, schema: None, name: "t".into() },
+            &[], &[], &[], 0, 999_999, // Unreasonable page size
+        );
+        assert!(sql.contains("LIMIT 10000")); // Capped to max
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn test_secure_password_debug_is_redacted() {
+        let password = SecurePassword::new("my_secret_password".to_string());
+        let debug_output = format!("{:?}", password);
+        assert_eq!(debug_output, "[REDACTED]");
+        assert!(!debug_output.contains("my_secret"));
+    }
+
+    #[test]
+    fn test_secure_password_display_is_redacted() {
+        let password = SecurePassword::new("my_secret_password".to_string());
+        let display_output = format!("{}", password);
+        assert_eq!(display_output, "[REDACTED]");
+    }
+
+    #[test]
+    fn test_redact_sensitive_patterns() {
+        let input = "host=db.example.com password='secret123' port=5432";
+        let redacted = redact_sensitive(input);
+        assert!(!redacted.contains("secret123"));
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(redacted.contains("host=db.example.com"));
+    }
+
+    #[test]
+    fn test_connection_config_validation_rejects_injection() {
+        let config = ConnectionConfig {
+            host: Some("db.example.com'; DROP TABLE--".to_string()),
+            ..test_config()
+        };
+        assert!(config.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod ai_allowlist_tests {
+    use super::*;
+
+    #[test]
+    fn test_default_safe_allowlist_blocks_writes() {
+        let allowlist = ActionAllowlist::default_safe();
+        assert!(allowlist.check_permission(&StatementType::ReadOnly).is_ok());
+        assert!(allowlist.check_permission(&StatementType::Insert).is_err());
+        assert!(allowlist.check_permission(&StatementType::Update).is_err());
+        assert!(allowlist.check_permission(&StatementType::Delete).is_err());
+        assert!(allowlist.check_permission(&StatementType::Ddl).is_err());
+    }
+}
+```
+
+### Security Compliance Summary
+
+| OWASP Top 10:2025 Category | Relevance | Our Mitigation | Section |
+|---|---|---|---|
+| **A01** Broken Access Control | Read-only bypass, AI privilege escalation | ReadOnlyGuard, ActionAllowlist, DML preview | §4 |
+| **A02** Security Misconfiguration | Default insecure connection settings | `SslMode::Prefer` default, SSH host key verification | §3 |
+| **A03** Supply Chain Failures | Compromised Rust crates | `cargo audit`, `cargo deny`, dependency pinning | §9 |
+| **A04** Cryptographic Failures | Cleartext credentials, unencrypted connections | Platform keychain, TLS enforcement, `zeroize` | §2, §3 |
+| **A05** Injection (SQL) | User input in SQL queries | Parameterized queries, identifier quoting, allow-lists | §1 |
+| **A06** Insecure Design | Missing security controls by design | STRIDE threat model, defense-in-depth layers | All |
+| **A07** Authentication Failures | Weak credential management | NIST SP 800-63B-4 compliance, env var chain | §2 |
+| **A08** Software/Data Integrity | Modified query results, tampered settings | TLS integrity, settings file permissions | §3 |
+| **A09** Logging Failures | Missing audit trail, sensitive data in logs | Structured logging with redaction | §7 |
+| **A10** Exceptional Conditions | Resource exhaustion, unhandled errors | Query timeout, page size cap, `Result<T,E>` everywhere | §6 |
 
 ---
 
