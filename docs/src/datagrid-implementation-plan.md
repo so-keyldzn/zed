@@ -8,6 +8,7 @@ data grid and database IDE experience to Zed, with agentic AI integration.
 - [Existing Foundation](#existing-foundation)
 - [Architecture Overview](#architecture-overview)
 - [Folder Structure Conventions](#folder-structure-conventions)
+- [UI/Interface Specification](#uiinterface-specification)
 - [Phase 0 — Infrastructure](#phase-0--infrastructure)
 - [Phase 1 — Connection & Schema](#phase-1--connection--schema)
 - [Phase 2 — Query Editor & Execution](#phase-2--query-editor--execution)
@@ -371,6 +372,1203 @@ database_core = { path = "../database_core" }
 agent = { path = "../agent" }
 context_server = { path = "../context_server" }
 ```
+
+---
+
+## UI/Interface Specification
+
+This section provides a comprehensive design for every visual component, interaction
+pattern, and layout decision in the database IDE experience. All designs reference
+existing GPUI primitives and Zed workspace APIs discovered through codebase exploration.
+
+### 1. Overall Layout and Navigation Flow
+
+```
++----------------------------------------------------------------------+
+| Toolbar: [Connection > Schema > Table]      [Execute] [Cancel] [Fmt] |
++-------------------+--------------------------------+-----------------+
+| Left Dock         | Center Pane(s)                 | Right Dock      |
+|                   |                                |                 |
+| ┌───────────────┐ | ┌────────────────────────────┐ | ┌─────────────┐ |
+| │ Database      │ | │ QueryEditor tab            │ | │ Value       │ |
+| │ Explorer      │ | │ (Item trait)               │ | │ Editor      │ |
+| │ (Panel trait) │ | │                            │ | │ (Panel)     │ |
+| │               │ | │ ┌────────────────────────┐ │ | │             │ |
+| │ ▼ Production  │ | │ │ SQL Editor             │ │ | │ JSON/XML/   │ |
+| │   ▼ public    │ | │ │ (Entity<Editor>)       │ │ | │ Hex/Image   │ |
+| │     ▼ Tables  │ | │ └────────────────────────┘ │ | │ preview     │ |
+| │       users   │ | │ ═══════════╤═══════════════ │ | │             │ |
+| │       orders  │ | │ ┌──────────┴───────────────┐│ | │             │ |
+| │     ▼ Views   │ | │ │ ResultGrid              ││ | │             │ |
+| │     ▼ Funcs   │ | │ │ (Table + uniform_list)  ││ | │             │ |
+| │               │ | │ │                         ││ | │             │ |
+| │ ▼ Staging     │ | │ └─────────────────────────┘│ | │             │ |
+| └───────────────┘ | └────────────────────────────┘ | └─────────────┘ |
++-------------------+--------------------------------+-----------------+
+| Status Bar: [● Production] [243 rows / 0.12s] [Ctrl+Enter to run]   |
++----------------------------------------------------------------------+
+```
+
+#### Component Placement Decisions
+
+| Component | Placement | Zed Trait | Priority | Icon |
+|---|---|---|---|---|
+| **DatabaseExplorer** | Left dock (default, movable) | `Panel` | 15 | `IconName::DatabaseZap` |
+| **QueryEditor** | Center pane tab | `Item` | — | `IconName::Database` + connection color |
+| **ResultGrid** | Embedded below QueryEditor (split) | Part of QueryEditor `Render` | — | — |
+| **ValueEditor** | Right dock (on-demand) | `Panel` | 16 | `IconName::TextSelect` |
+| **ConnectionDialog** | Modal overlay (centered) | `ModalView` | — | — |
+| **QueryBreadcrumbs** | Toolbar (PrimaryLeft) | `ToolbarItemView` | — | — |
+| **QueryActions** | Toolbar (PrimaryRight) | `ToolbarItemView` | — | — |
+| **DatabaseStatusItem** | Status bar (right section) | `StatusItemView` | — | — |
+| **AggregateView** | Floating popover on selection | `Popover` (anchored) | — | — |
+
+#### Coexistence with Code Editing
+
+DatabaseExplorer is a dock panel just like ProjectPanel and TerminalPanel. It coexists
+in the left dock — users toggle between them via the dock icon bar. QueryEditor tabs
+appear in standard Pane tabs alongside code editor tabs, so users can have SQL and Rust
+files open simultaneously. The ResultGrid is embedded within the QueryEditor item
+(vertical split), not a separate panel, to avoid cluttering the dock.
+
+Panel registration follows the existing pattern in `crates/zed/src/zed.rs`:
+
+```rust
+// In initialize_panels(), alongside existing panel registrations
+workspace.register_panel::<DatabaseExplorer>(window, cx);
+workspace.register_panel::<ValueEditor>(window, cx);
+```
+
+### 2. Database Explorer Panel
+
+#### Entity Structure
+
+```rust
+pub struct DatabaseExplorer {
+    connections: Vec<ConnectionNode>,
+    filter_editor: Entity<Editor>,           // Single-line fuzzy filter
+    filter_text: String,
+    selected_index: Option<usize>,
+    scroll_handle: UniformListScrollHandle,
+    focus_handle: FocusHandle,
+    context_menu: Option<Entity<ContextMenu>>,
+    width: Option<Pixels>,
+    pending_serialization: Task<()>,
+    _subscriptions: Vec<Subscription>,
+}
+```
+
+#### Tree Hierarchy (4 Levels)
+
+```
+▼ 🔌 Production (green border-left 2px)        ← ConnectionNode
+  ▼ 📦 mydb                                     ← DatabaseNode
+    ▼ 📐 public                                  ← SchemaNode
+      ▼ 📋 Tables (3)                            ← CategoryNode
+        ▼ users                                   ← TableNode
+            id (PK, int4)                          ← ColumnNode
+            email (varchar, NOT NULL)              ← ColumnNode
+            created_at (timestamptz)               ← ColumnNode
+        ▶ orders                                   ← TableNode (collapsed)
+        ▶ products                                 ← TableNode (collapsed)
+      ▶ 👁 Views (1)                               ← CategoryNode
+      ▶ ƒ Functions (5)                            ← CategoryNode
+      ▶ 📊 Sequences (2)                           ← CategoryNode
+  ▼ 📐 information_schema                        ← SchemaNode
+    ...
+▶ 🔌 Staging (blue border-left 2px)              ← ConnectionNode (collapsed)
+```
+
+#### Rendering Pattern (ProjectPanel-style)
+
+Each tree node renders as a `ListItem` with the following customization:
+
+```rust
+// Pseudocode for rendering a tree node
+fn render_tree_node(&self, node: &TreeNode, window: &mut Window, cx: &mut App) -> AnyElement {
+    ListItem::new(node.id())
+        .indent_level(node.depth())
+        .indent_step_size(px(20.))
+        .toggle(if node.has_children() { Some(node.is_expanded()) } else { None })
+        .on_toggle(cx.listener(move |this, _, window, cx| {
+            this.toggle_expanded(node_id, window, cx);
+        }))
+        .start_slot(
+            Icon::new(node.icon_name())
+                .size(IconSize::Small)
+                .color(node.icon_color())
+        )
+        .end_hover_slot(self.render_hover_actions(node, cx))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.select_node(node_id, window, cx);
+        }))
+        .on_secondary_mouse_down(cx.listener(move |this, event, window, cx| {
+            this.show_context_menu(node_id, event.position, window, cx);
+        }))
+        .when(node.is_connection(), |item| {
+            item.child(
+                div()
+                    .absolute().left_0().top_0().bottom_0()
+                    .w(px(2.))
+                    .bg(node.connection_color())
+            )
+        })
+        .child(Label::new(node.display_name()).size(LabelSize::Small))
+        .into_any_element()
+}
+```
+
+#### Node Icons
+
+| Node Type | Icon | Color |
+|---|---|---|
+| Connection (connected) | `DatabaseZap` | `Color::Success` |
+| Connection (disconnected) | `Database` | `Color::Muted` |
+| Database | `Package` | `Color::Default` |
+| Schema | `Layers` | `Color::Default` |
+| Tables (category) | `Table` (new) | `Color::Accent` |
+| Views (category) | `Eye` | `Color::Accent` |
+| Functions (category) | `Code` | `Color::Accent` |
+| Sequences (category) | `Hash` | `Color::Accent` |
+| Table | `Table` (new) | `Color::Default` |
+| View | `Eye` | `Color::Default` |
+| Column (PK) | `Key` (new) | `Color::Warning` |
+| Column (FK) | `ArrowUpRight` | `Color::Info` |
+| Column (regular) | `Minus` | `Color::Muted` |
+| Index | `ListFilter` | `Color::Muted` |
+
+#### Connection Color Coding
+
+Each connection is assigned a color from a palette of 8:
+
+```rust
+pub const CONNECTION_COLORS: [Hsla; 8] = [
+    hsla(0.0, 0.7, 0.5, 1.0),    // Red — production
+    hsla(0.33, 0.7, 0.4, 1.0),   // Green — development
+    hsla(0.58, 0.7, 0.5, 1.0),   // Blue — staging
+    hsla(0.08, 0.8, 0.5, 1.0),   // Orange — QA
+    hsla(0.75, 0.6, 0.5, 1.0),   // Purple — analytics
+    hsla(0.47, 0.7, 0.4, 1.0),   // Teal — replica
+    hsla(0.89, 0.6, 0.5, 1.0),   // Pink — test
+    hsla(0.14, 0.8, 0.5, 1.0),   // Yellow — local
+];
+```
+
+Color is applied to:
+- 2px left border on the connection node in the explorer
+- Tab border-bottom on QueryEditor tabs
+- Dot indicator in the status bar
+- Top border on the ResultGrid header row
+
+#### Fuzzy Filter
+
+- Single-line `Entity<Editor>` at the top of the panel (visible on `Ctrl+F` or always visible)
+- Filters all visible nodes using fuzzy matching (reuse `fuzzy` crate)
+- Matching ranges highlighted with `Color::Accent` on the label
+- Empty state: "No matching objects" with muted text
+
+#### Lazy Loading Strategy
+
+| Level | Trigger | Data Loaded |
+|---|---|---|
+| L0 | Connection established | Database names only |
+| L1 | Expand database/schema | Object names + types (tables, views, functions) |
+| L2 | Expand table/view | Column names, types, PK/FK, NOT NULL |
+| L3 | Explicit "Load DDL" action | Full DDL / source code |
+
+Loading indicator: `ListItem` with a `Spinner` element in the start slot while loading.
+
+#### Context Menus (Per Node Type)
+
+**Connection node:**
+- New Query Console → opens empty QueryEditor tab
+- Refresh → re-introspects all schemas
+- Disconnect / Reconnect
+- Edit Connection... → opens ConnectionDialog
+- Duplicate Connection
+- Remove Connection
+
+**Table node:**
+- Open Table Data → opens QueryEditor with `SELECT * FROM ...` + executes
+- Edit Table Data → same but with auto-commit off
+- New Query on Table → opens QueryEditor with `SELECT * FROM table`
+- Copy Qualified Name → clipboard
+- Generate: INSERT / SELECT / UPDATE / CREATE → clipboard
+- Drop Table... → confirmation modal
+
+**Column node:**
+- Filter by this Column → adds WHERE clause in active QueryEditor
+- Copy Column Name
+- Sort by this Column
+
+#### Drag-and-Drop
+
+Tables and columns are draggable (using GPUI's `.on_drag()` / `.on_drop()` pattern from
+`SplitEditorView`). Dropping onto a QueryEditor inserts the fully-qualified name at cursor.
+
+```rust
+// On the tree ListItem
+.on_drag(DraggedDatabaseObject { qualified_name, object_type }, |_, _, _, cx| {
+    cx.new(|_| Label::new(qualified_name.clone()))
+})
+
+// On the QueryEditor
+.on_drop::<DraggedDatabaseObject>(cx.listener(|this, payload, window, cx| {
+    this.editor.update(cx, |editor, cx| {
+        editor.insert(&payload.qualified_name, window, cx);
+    });
+}))
+```
+
+### 3. Connection Dialog
+
+#### Entity Structure
+
+```rust
+pub struct ConnectionDialog {
+    mode: DialogMode,                        // New | Edit(ConnectionId)
+    driver_tab: DriverType,                  // PostgreSQL | MySQL | SQLite | ...
+    name_editor: Entity<Editor>,
+    host_editor: Entity<Editor>,
+    port_editor: Entity<Editor>,
+    database_editor: Entity<Editor>,
+    user_editor: Entity<Editor>,
+    password_editor: Entity<Editor>,
+    selected_color: usize,                   // Index into CONNECTION_COLORS
+    ssh_enabled: bool,
+    ssh_host_editor: Entity<Editor>,
+    ssh_port_editor: Entity<Editor>,
+    ssh_user_editor: Entity<Editor>,
+    ssh_key_path_editor: Entity<Editor>,
+    ssl_mode: SslMode,                       // Disable | Prefer | Require | VerifyCA | VerifyFull
+    ssl_ca_path_editor: Entity<Editor>,
+    ssl_cert_path_editor: Entity<Editor>,
+    ssl_key_path_editor: Entity<Editor>,
+    test_status: TestConnectionStatus,       // Idle | Testing | Success(Duration) | Failed(String)
+    focus_handle: FocusHandle,
+}
+
+pub enum DialogMode { New, Edit(ConnectionId) }
+pub enum TestConnectionStatus {
+    Idle,
+    Testing,
+    Success(Duration),
+    Failed(String),
+}
+```
+
+#### Layout (ModalView)
+
+```
+┌──────────────────────────────────────────────────────┐
+│  New Connection                                   ✕  │
+├──────────────────────────────────────────────────────┤
+│  [PostgreSQL] [MySQL] [SQLite] [DuckDB] [MSSQL]     │  ← Driver tabs
+│                                                      │
+│  Name:     [Production DB_____________________________]│
+│  Color:    ● ● ● ● ● ● ● ●                         │  ← 8 color pastilles
+│                                                      │
+│  Host:     [db.example.com____________________________]│
+│  Port:     [5432__]  Database: [myapp________________]│
+│  User:     [admin_____________________________________]│
+│  Password: [••••••••__________________________________]│
+│                                                      │
+│  ▶ SSH Tunnel                                        │  ← Disclosure (collapsed)
+│  ▶ SSL / TLS                                         │  ← Disclosure (collapsed)
+│                                                      │
+│  [Test Connection]  ✓ Connected (45ms)               │  ← Test result inline
+│                                                      │
+├──────────────────────────────────────────────────────┤
+│                           [Cancel]  [Save Connection]│
+└──────────────────────────────────────────────────────┘
+```
+
+#### Implementation Details
+
+- Implements `ModalView` + `EventEmitter<DismissEvent>` + `Focusable`
+- `fade_out_background() -> true` for dimmed background overlay
+- Driver tabs rendered as a `TabBar` with custom icons per driver
+- Each form field is an `Entity<Editor>` in single-line mode
+- Password field uses a custom `Editor` with character masking
+- Color picker: 8 `div()` circles with `.rounded_full().w(px(16.)).h(px(16.)).bg(color)`,
+  selected one gets a `border_2()` ring
+- SSH/SSL sections use `Disclosure` components, collapsed by default
+- "Test Connection" spawns a background task via `cx.spawn()`, updates `test_status`
+- Result shown inline: green checkmark + latency, or red X + error message
+- Footer: `ModalFooter` with Cancel (dismisses) and Save (validates + persists)
+- SQLite driver tab hides Host/Port/User/Password, shows only file path picker
+- Tab key navigates between form fields (standard GPUI focus chain)
+
+### 4. Query Editor (Workspace Item)
+
+#### Entity Structure
+
+```rust
+pub struct QueryEditor {
+    editor: Entity<Editor>,                  // SQL editor (full Editor with language server)
+    connection_id: Option<ConnectionId>,
+    schema: Option<String>,
+    result_grid: Option<Entity<ResultGrid>>,
+    split_state: Entity<SplitState>,         // Manages vertical split ratio
+    execution_state: ExecutionState,
+    tab_name: Option<String>,                // From `-- @name Foo` comment
+    focus_handle: FocusHandle,
+    _subscriptions: Vec<Subscription>,
+}
+
+pub struct SplitState {
+    ratio: f32,                              // 0.0-1.0, default 0.5
+    visible_ratio: f32,                      // During drag
+    cached_height: Pixels,
+    is_dragging: bool,
+}
+
+pub enum ExecutionState {
+    Idle,
+    Executing { task: Task<()>, started_at: Instant },
+    Completed { duration: Duration, row_count: usize },
+    Failed { error: DatabaseError, duration: Duration },
+}
+```
+
+#### Render Layout (Vertical Split)
+
+```rust
+impl Render for QueryEditor {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ratio = self.split_state.read(cx).visible_ratio;
+
+        v_flex()
+            .size_full()
+            .child(
+                // SQL Editor (top section)
+                div()
+                    .flex_grow()
+                    .flex_basis(relative(ratio))
+                    .min_h(px(60.))
+                    .child(self.editor.clone())
+            )
+            .when_some(self.result_grid.as_ref(), |this, grid| {
+                this
+                    .child(self.render_split_handle(window, cx))  // Draggable divider
+                    .child(
+                        // Result Grid (bottom section)
+                        div()
+                            .flex_grow()
+                            .flex_basis(relative(1.0 - ratio))
+                            .min_h(px(60.))
+                            .child(grid.clone())
+                    )
+            })
+            .when(matches!(self.execution_state, ExecutionState::Failed { .. }), |this| {
+                this.child(self.render_error_banner(window, cx))
+            })
+    }
+}
+```
+
+#### Split Handle (Draggable Divider)
+
+Follows the exact pattern from `crates/editor/src/split_editor_view.rs`:
+
+```rust
+fn render_split_handle(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    let split_state = self.split_state.clone();
+    div()
+        .h(px(6.))
+        .w_full()
+        .cursor_row_resize()
+        .bg(cx.theme().colors().border)
+        .hover(|style| style.bg(cx.theme().colors().border_focused))
+        .on_drag(DraggedSplitHandle, |_, _, _, cx| cx.new(|_| gpui::Empty))
+        .on_drag_move::<DraggedSplitHandle>(
+            cx.listener(move |this, event: &DragMoveEvent<DraggedSplitHandle>, window, cx| {
+                this.split_state.update(cx, |state, cx| {
+                    state.on_drag_move(event, window, cx);
+                });
+            })
+        )
+        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            if event.click_count() >= 2 {
+                // Double-click resets to 50/50
+                this.split_state.update(cx, |state, cx| {
+                    state.ratio = 0.5;
+                    state.visible_ratio = 0.5;
+                    cx.notify();
+                });
+            }
+        }))
+}
+```
+
+#### Item Trait Implementation
+
+```rust
+impl Item for QueryEditor {
+    type Event = QueryEditorEvent;
+
+    fn tab_content(&self, params: TabContentParams, window: &Window, cx: &App) -> AnyElement {
+        let connection_color = self.connection_color(cx);
+        h_flex()
+            .gap_1()
+            .when_some(connection_color, |this, color| {
+                // Colored dot for connection identity
+                this.child(div().w(px(6.)).h(px(6.)).rounded_full().bg(color))
+            })
+            .child(Label::new(self.tab_name(cx)).color(params.text_color()))
+            .into_any_element()
+    }
+
+    fn tab_icon(&self, _: &Window, _: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::Database))
+    }
+
+    fn breadcrumb_location(&self, _: &App) -> ToolbarItemLocation {
+        ToolbarItemLocation::PrimaryLeft
+    }
+
+    fn breadcrumbs(&self, cx: &App) -> Option<Vec<BreadcrumbText>> {
+        // Connection > Schema path shown in breadcrumbs
+        let mut crumbs = vec![];
+        if let Some(conn) = &self.connection_id {
+            crumbs.push(BreadcrumbText {
+                text: conn.display_name().into(),
+                highlights: None, font: None,
+            });
+        }
+        if let Some(schema) = &self.schema {
+            crumbs.push(BreadcrumbText {
+                text: schema.clone().into(),
+                highlights: None, font: None,
+            });
+        }
+        Some(crumbs)
+    }
+
+    fn show_toolbar(&self) -> bool { true }
+    fn is_dirty(&self, cx: &App) -> bool { self.editor.read(cx).is_dirty(cx) }
+}
+```
+
+#### Tab Naming Convention
+
+Priority order:
+1. `-- @name My Query` comment in first 5 lines → "My Query"
+2. Saved file name → "users_report.sql"
+3. Auto-generated → "Query 1", "Query 2", etc.
+
+#### Error Banner (Between Editor and Grid)
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ ✕  ERROR at line 3: column "emial" does not exist        │
+│    Hint: Perhaps you meant "email"?                      │
+│    [Go to Error]  [Dismiss]                              │
+└──────────────────────────────────────────────────────────┘
+```
+
+- Red left border (4px)
+- `Icon::new(IconName::XCircle).color(Color::Error)`
+- Error text selectable (wrapped in an `Entity<Editor>` read-only)
+- "Go to Error" jumps cursor to the SQL position if available
+- Dismissible with Escape or X button
+- Replaces previous error on re-execution
+
+### 5. Result Grid
+
+#### Entity Structure
+
+```rust
+pub struct ResultGrid {
+    columns: Vec<ColumnDef>,
+    rows: Arc<Vec<Row>>,
+    total_row_count: Option<usize>,          // Server-side total if known
+    page: usize,
+    page_size: usize,
+    sort_state: Vec<SortColumn>,             // Multi-column sort stack
+    filters: Vec<ColumnFilter>,
+    selection: GridSelection,
+    pending_edits: IndexMap<CellAddress, PendingEdit>,
+    view_mode: ViewMode,                     // Grid | Record
+    table_interaction_state: Entity<TableInteractionState>,
+    column_widths: Entity<TableColumnWidths>,
+    focus_handle: FocusHandle,
+    _subscriptions: Vec<Subscription>,
+}
+
+pub enum GridSelection {
+    None,
+    Cell { row: usize, col: usize },
+    Range { start: (usize, usize), end: (usize, usize) },
+    Rows(Vec<usize>),
+    Columns(Vec<usize>),
+    All,
+}
+
+pub enum ViewMode { Grid, Record }
+
+pub struct PendingEdit {
+    original: CellValue,
+    current: CellValue,
+    kind: EditKind,                          // Insert | Update | Delete
+}
+```
+
+#### Table Rendering
+
+Built on `Table` from `crates/ui/src/components/data_table.rs`:
+
+```rust
+fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    let connection_color = self.connection_color(cx);
+
+    v_flex()
+        .size_full()
+        .child(
+            Table::new(self.columns.len())
+                .header(self.render_column_headers(window, cx))
+                .uniform_list(
+                    "result-grid",
+                    self.rows.len(),
+                    cx.listener(Self::render_rows),
+                )
+                .interactable(&self.table_interaction_state)
+                .resizable_columns(
+                    TableResizeBehavior::Resizable,
+                    &self.column_widths,
+                    cx,
+                )
+                .striped()
+                .map_row(cx.listener(Self::style_row))
+                .when_some(connection_color, |table, color| {
+                    // Colored top border on header
+                    table  // Applied via map_row on row 0
+                })
+        )
+        .child(self.render_pagination_bar(window, cx))
+}
+```
+
+#### Column Headers
+
+Each column header is interactive:
+
+```
+┌──────────────┬──────────────┬──────────────┬──────────────┐
+│ id ▲1  🔍    │ name    🔍   │ email ▼2 🔍  │ created_at   │
+├──────────────┼──────────────┼──────────────┼──────────────┤
+```
+
+- **Click** on column name → toggle sort (None → ASC → DESC → None)
+- **Shift+Click** → add to multi-column sort (shows priority number)
+- **Sort indicator**: `▲` / `▼` arrow + sort priority number for multi-sort
+- **Filter icon** (`🔍`): opens `PopoverMenu` with filter options:
+
+```
+┌─────────────────────────────┐
+│ Filter: email               │
+│ ┌─────────────────────────┐ │
+│ │ Contains...             │ │  ← Entity<Editor> single-line
+│ └─────────────────────────┘ │
+│ ○ Contains    ○ Equals      │
+│ ○ Starts with ○ Regex       │
+│ ○ Is NULL     ○ Is NOT NULL │
+│ [Clear]           [Apply]   │
+└─────────────────────────────┘
+```
+
+#### Cell Rendering by Data Type
+
+| Type | Rendering | Alignment | Font |
+|---|---|---|---|
+| `NULL` | `"NULL"` in italic, `Color::Muted`, `opacity(0.5)` | — | UI font |
+| `Integer` | Formatted with grouping separators (settings) | Right | Monospace |
+| `Float` | Formatted with decimal + grouping (settings) | Right | Monospace |
+| `String` | Text, truncated with `…` at cell boundary | Left | UI font |
+| `Boolean` | `"true"` in green / `"false"` in red + checkbox icon | Center | UI font |
+| `Date` | ISO 8601 format (configurable) | Left | Monospace |
+| `Timestamp` | ISO 8601 with timezone (configurable) | Left | Monospace |
+| `JSON` | First-line preview + `Icon::new(IconName::Braces)` | Left | Monospace |
+| `BLOB` | Formatted size (e.g. "4.2 KB") + `Icon::new(IconName::Binary)` | Left | UI font |
+| `UUID` | Full UUID string, monospace | Left | Monospace |
+| `Array` | `"{1,2,3}"` formatted, truncated | Left | Monospace |
+
+#### Cell Selection Visual States
+
+```rust
+fn style_row(&self, (row_index, row_div): (usize, Stateful<Div>), window: &mut Window, cx: &mut App) -> AnyElement {
+    let is_selected = self.selection.contains_row(row_index);
+    let has_pending_edit = self.pending_edits.values().any(|e| e.row == row_index);
+
+    row_div
+        .when(is_selected, |div| {
+            div.bg(cx.theme().colors().element_selected)
+        })
+        .when(has_pending_edit, |div| {
+            let edit = self.pending_edit_for_row(row_index);
+            match edit.kind {
+                EditKind::Insert => div.bg(hsla(0.33, 0.3, 0.5, 0.12)),  // Green tint
+                EditKind::Update => div.bg(hsla(0.14, 0.3, 0.5, 0.12)), // Yellow tint
+                EditKind::Delete => div.bg(hsla(0.0, 0.3, 0.5, 0.12))   // Red tint
+                    .child(div().absolute().inset_0().bg(hsla(0.0, 0.0, 0.5, 0.3))), // Strikethrough overlay
+            }
+        })
+        .into_any_element()
+}
+```
+
+#### Inline Cell Editing
+
+- **Trigger**: Double-click or Enter/F2 on selected cell
+- **Mechanism**: Replace cell element with an `Entity<Editor>` single-line
+- **Confirm**: Enter (commits edit to pending_edits), Tab (commits + moves right)
+- **Cancel**: Escape (reverts to original)
+- **Boolean cells**: Space toggles directly (no editor needed)
+- **NULL cells**: Ctrl+Delete or Delete sets cell to NULL
+- **Visual feedback**: Edited cell gets a small colored triangle in top-left corner
+
+```rust
+fn render_cell(&self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    if self.editing_cell == Some((row, col)) {
+        // Render inline editor
+        div()
+            .size_full()
+            .child(self.inline_editor.clone())
+            .into_any_element()
+    } else {
+        let value = &self.rows[row][col];
+        let pending = self.pending_edits.get(&CellAddress { row, col });
+
+        div()
+            .size_full()
+            .when_some(pending, |div, edit| {
+                // Edited indicator triangle
+                div.child(
+                    div().absolute().top_0().left_0()
+                        .w(px(6.)).h(px(6.))
+                        .bg(edit.kind.indicator_color())
+                        .clip_path("polygon(0 0, 100% 0, 0 100%)")
+                )
+            })
+            .child(self.render_typed_value(value, &self.columns[col], cx))
+            .into_any_element()
+    }
+}
+```
+
+#### Pagination Bar
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ 243 rows (0.12s) │ ◀ 1 2 [3] 4 5 ▶ │ Page size: [500 ▾] │ ⟳  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+- **Left section**: Row count + query execution time
+- **Center**: Page navigation (when total > page_size)
+- **Right**: Page size dropdown (`PopoverMenu` with [100, 500, 1000, 5000]) + Refresh button
+- **Behavior**: Page changes re-execute query with `LIMIT/OFFSET`
+
+#### Context Menus
+
+**Cell context menu** (right-click on data cell):
+- Copy Cell Value (Ctrl+C)
+- Copy Row as: INSERT | CSV | JSON | Tab-separated
+- Edit Cell (F2)
+- Set to NULL (Delete)
+- Filter by This Value
+- ─── (separator)
+- Add Row
+- Clone Row
+- Delete Row(s)
+
+**Column header context menu:**
+- Sort Ascending / Descending / Clear Sort
+- Filter Column...
+- Hide Column
+- Show All Columns
+- ─── (separator)
+- Resize to Fit Content
+- Copy Column Name
+
+**Row header context menu** (when clicking row numbers, if shown):
+- Copy Selected Rows
+- Delete Selected Rows
+- Clone Row
+
+### 6. Toolbar and Status Bar
+
+#### Toolbar Components
+
+The toolbar is visible whenever a `QueryEditor` or detached `ResultGrid` is the active pane item.
+
+**PrimaryLeft — QueryBreadcrumbs:**
+
+```rust
+pub struct QueryBreadcrumbs {
+    active_query_editor: Option<WeakEntity<QueryEditor>>,
+}
+
+impl ToolbarItemView for QueryBreadcrumbs {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn ItemHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ToolbarItemLocation {
+        self.active_query_editor = active_pane_item
+            .and_then(|item| item.act_as::<QueryEditor>(cx))
+            .map(|entity| entity.downgrade());
+
+        if self.active_query_editor.is_some() {
+            ToolbarItemLocation::PrimaryLeft
+        } else {
+            ToolbarItemLocation::Hidden
+        }
+    }
+}
+```
+
+Renders as: `[● Connection Name ▾]` > `[Schema Name ▾]`
+
+Each segment is a `PopoverMenu` trigger that opens a `ContextMenu` listing available
+connections / schemas respectively. Selecting one switches the active QueryEditor's
+connection or schema.
+
+**PrimaryRight — QueryActions:**
+
+| Button | Icon | Action | Shortcut | Visibility |
+|---|---|---|---|---|
+| Execute | `Play` | `ExecuteQuery` | `Ctrl+Enter` | Always |
+| Cancel | `Square` | `CancelQuery` | `Escape` | While executing |
+| Explain | `ChartLine` | `ExplainQuery` | `Ctrl+Shift+E` | Always |
+| Format | `Paintbrush` | `FormatQuery` | `Ctrl+Shift+F` | Always |
+| Record View | `Table2` | `ToggleRecordView` | `Ctrl+Shift+R` | When results exist |
+| Detach Grid | `PanelBottom` | `DetachResultGrid` | — | When results exist |
+
+Execute button shows a `Spinner` icon while query is running.
+
+#### Status Bar — DatabaseStatusItem
+
+```rust
+pub struct DatabaseStatusItem {
+    active_connection: Option<ConnectionInfo>,
+    execution_state: Option<ExecutionStateSnapshot>,
+}
+
+impl StatusItemView for DatabaseStatusItem {
+    fn set_active_pane_item(&mut self, item: Option<&dyn ItemHandle>, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_connection = item
+            .and_then(|i| i.act_as::<QueryEditor>(cx))
+            .and_then(|qe| qe.read(cx).connection_info(cx));
+    }
+}
+```
+
+Renders as:
+
+```
+[● Production] [🔒 Read-only] [243 rows / 0.12s] [⟳ Executing...]
+```
+
+- Colored dot matches connection color
+- Lock icon for read-only connections
+- Row count + execution time from last query
+- Spinner + "Executing..." during query execution
+- Click on connection name opens connection switcher
+- Hidden when no QueryEditor is active
+
+### 7. Tab Management
+
+#### Tab Behavior for QueryEditor
+
+| Action | Tab Behavior |
+|---|---|
+| Double-click table in Explorer | Opens as **preview tab** (italic title), replaced by next preview |
+| Start editing SQL | Preview tab becomes **permanent** (regular title) |
+| "New Query" from Explorer | Opens as permanent tab |
+| Execute query | Tab stays (results appear in split below) |
+| Pin tab (`TogglePinTab`) | Tab cannot be replaced or auto-closed |
+
+#### Tab Indicators
+
+```
+┌─────────────────────────────────────────────────────┐
+│ [● Query 1] [● users ⟳] [📌 orders] [+ migrations] │
+└─────────────────────────────────────────────────────┘
+```
+
+- `●` colored dot = connection color
+- `⟳` = query currently executing
+- `📌` = pinned tab
+- Italic title = preview tab
+- `•` modified indicator = has unsaved edits (pending changes to commit)
+
+#### Tab Extra Context Menu
+
+```rust
+impl Item for QueryEditor {
+    fn tab_extra_context_menu_actions(&self, _: &mut Window, _: &mut Context<Self>) -> Vec<(SharedString, Box<dyn Action>)> {
+        vec![
+            ("Copy as SQL".into(), Box::new(CopyAsSql)),
+            ("Export Results...".into(), Box::new(ExportResults)),
+            ("Change Connection...".into(), Box::new(ChangeConnection)),
+        ]
+    }
+}
+```
+
+### 8. Side Panels
+
+#### Value Editor Panel (Right Dock)
+
+**Purpose**: Full-content editor for large cell values (JSON, XML, BLOB, long text).
+
+```rust
+pub struct ValueEditor {
+    content_editor: Option<Entity<Editor>>,
+    content_type: ContentType,
+    source_cell: Option<CellAddress>,
+    is_read_only: bool,
+    focus_handle: FocusHandle,
+    width: Option<Pixels>,
+}
+
+pub enum ContentType {
+    Json,
+    Xml,
+    PlainText,
+    Hex(Vec<u8>),
+    Image(Arc<[u8]>),
+}
+```
+
+**Trigger**: Double-click on JSON/BLOB/XML cell, or `Ctrl+Shift+V` on selected cell.
+
+**Rendering by type**:
+- **JSON**: `Entity<Editor>` with `LanguageId::Json` for syntax highlighting + folding
+- **XML**: `Entity<Editor>` with `LanguageId::Xml`
+- **Plain text**: `Entity<Editor>` with word wrap enabled
+- **Hex (binary)**: Custom hex view — 16 bytes per line, offset + hex + ASCII columns
+- **Image (detected BLOB)**: `gpui::img(data)` centered in panel
+
+**Panel implementation**:
+```rust
+impl Panel for ValueEditor {
+    fn persistent_name() -> &'static str { "ValueEditor" }
+    fn panel_key() -> &'static str { "ValueEditor" }
+    fn position(&self, ..) -> DockPosition { DockPosition::Right }
+    fn icon(&self, ..) -> Option<IconName> { Some(IconName::TextSelect) }
+    fn activation_priority(&self) -> u32 { 16 }
+    fn starts_open(&self, ..) -> bool { false }  // Hidden by default
+    fn toggle_action(&self) -> Box<dyn Action> { Box::new(ToggleValueEditor) }
+}
+```
+
+#### Record View (Alternate Mode in ResultGrid)
+
+Not a separate panel — a mode toggle within `ResultGrid` that switches from grid to
+a vertical single-row layout:
+
+```
+┌──────────────────────────────────────────────────┐
+│  ◀ Row 42 of 243 ▶                              │
+├──────────────────────────────────────────────────┤
+│  id            │ 42                              │
+│  name          │ John Doe                        │
+│  email         │ john@example.com                │
+│  bio           │ Software engineer living in...  │
+│  avatar_url    │ https://cdn.example.com/...     │
+│  created_at    │ 2024-01-15T10:30:00Z            │
+│  updated_at    │ 2024-03-01T14:22:00Z            │
+│  is_active     │ ✓ true                          │
+│  metadata      │ {"role":"admin","permi...  [▸]  │
+│  profile_image │ 12.4 KB                    [▸]  │
+└──────────────────────────────────────────────────┘
+```
+
+- Rendered as a 2-column `Table` (field name | value)
+- Navigation: `◀ ▶` or Up/Down arrows move between rows
+- `[▸]` on JSON/BLOB cells opens ValueEditor panel
+- Editable: clicking on a value cell enters edit mode
+- Toggle: `Ctrl+Shift+R` or toolbar button
+
+#### Aggregate View (Floating Popover)
+
+Appears automatically when selecting multiple numeric cells (range selection):
+
+```
+┌─────────────────────────┐
+│ Count: 15               │
+│ Sum:   4,523.50         │
+│ Avg:   301.57           │
+│ Min:   12.00            │
+│ Max:   892.00           │
+└─────────────────────────┘
+```
+
+- Uses `Popover` component anchored to bottom-right of selection area
+- Updates dynamically as selection changes
+- Only appears for columns with numeric types
+- Dismisses when selection is cleared
+- Can be pinned (click keeps it visible until explicit close)
+
+### 9. Keyboard Navigation and Shortcuts
+
+#### Grid Navigation
+
+| Key | Action | Context |
+|---|---|---|
+| `Arrow keys` | Move selection by one cell | Grid focused |
+| `Shift+Arrow` | Extend selection range | Grid focused |
+| `Ctrl+Arrow` | Jump to edge of data region | Grid focused |
+| `Ctrl+Shift+Arrow` | Extend selection to edge | Grid focused |
+| `Home` / `End` | First / last column in row | Grid focused |
+| `Ctrl+Home` / `Ctrl+End` | First / last cell in grid | Grid focused |
+| `Tab` / `Shift+Tab` | Next / previous cell | Grid or editing |
+| `Enter` / `F2` | Start editing cell | Cell selected |
+| `Escape` | Cancel edit / clear selection | Editing or selected |
+| `Space` | Toggle boolean cell | Boolean cell selected |
+| `Delete` | Set cell to NULL | Cell selected |
+| `Ctrl+A` | Select all cells | Grid focused |
+| `Ctrl+C` | Copy selection | Any selection |
+| `Ctrl+V` | Paste into selection | Cell selected |
+| `Ctrl+Z` | Undo pending edit | Has pending edits |
+| `Ctrl+Shift+Z` | Redo pending edit | Has undone edits |
+| `Ctrl+D` | Duplicate selected row(s) | Row(s) selected |
+| `Ctrl+Minus` | Delete selected row(s) | Row(s) selected |
+| `Ctrl+Plus` | Insert new row | Grid focused |
+| `PageDown` / `PageUp` | Next / previous page | Grid focused |
+
+#### Query Execution
+
+| Key | Action | Context |
+|---|---|---|
+| `Ctrl+Enter` | Execute query (or selected text) | QueryEditor focused |
+| `Escape` | Cancel running query | Query executing |
+| `Ctrl+Shift+E` | Explain query plan | QueryEditor focused |
+| `Ctrl+Shift+F` | Format/beautify SQL | QueryEditor focused |
+| `Ctrl+Shift+R` | Toggle Record View | Results exist |
+| `Ctrl+Shift+V` | Open Value Editor for cell | Cell selected |
+
+#### Panel Navigation
+
+| Key | Action | Context |
+|---|---|---|
+| `Ctrl+Shift+D` | Toggle Database Explorer | Global |
+| `Ctrl+Shift+B` | Toggle Value Editor | Global |
+| `F5` | Refresh Explorer tree | Explorer focused |
+| `Ctrl+F` | Focus filter in Explorer | Explorer focused |
+
+#### Vim Mode Integration
+
+When `vim_mode` setting is enabled, the ResultGrid registers an additional `KeyContext`
+to support vim-style navigation:
+
+```rust
+// In ResultGrid's key_context contribution
+fn contribute_key_context(&self, context: &mut KeyContext, cx: &App) {
+    context.add("ResultGrid");
+    if self.is_editing() {
+        context.set("grid_mode", "editing");
+    } else {
+        context.set("grid_mode", "normal");
+    }
+}
+```
+
+**Vim normal mode bindings** (context: `ResultGrid && grid_mode == normal`):
+
+| Key | Action | Equivalent |
+|---|---|---|
+| `h` / `j` / `k` / `l` | Move cell | Arrow keys |
+| `g g` | Go to first row | Ctrl+Home |
+| `G` | Go to last row | Ctrl+End |
+| `0` / `$` | First / last column | Home / End |
+| `i` | Edit cell | Enter/F2 |
+| `/` | Open column filter | Ctrl+F on column |
+| `y y` | Copy row | Ctrl+C on row |
+| `d d` | Delete row | Ctrl+Minus |
+| `o` | Insert row below | Ctrl+Plus |
+| `v` | Start visual selection | Shift+Arrow |
+| `V` | Select entire row | Click row header |
+| `:w` | Commit pending changes | Submit button |
+| `:q` | Close tab | Standard close |
+
+### 10. Visual Design Language
+
+#### Color Palette for Data States
+
+| State | Background | Border | Use |
+|---|---|---|---|
+| Selected cell | `theme.colors().element_selected` | — | Current selection |
+| Selected range | `theme.colors().element_selected` at 60% | — | Multi-cell selection |
+| Pending INSERT | `hsla(0.33, 0.3, 0.5, 0.12)` | Green left 2px | New row |
+| Pending UPDATE | `hsla(0.14, 0.3, 0.5, 0.12)` | Yellow left 2px | Modified cell/row |
+| Pending DELETE | `hsla(0.0, 0.3, 0.5, 0.12)` + strikethrough | Red left 2px | Deleted row |
+| Hover row | `theme.colors().element_hover` | — | Mouse hover |
+| Error | `hsla(0.0, 0.4, 0.5, 0.08)` | Red left 4px | Error banner |
+| Success | `hsla(0.33, 0.4, 0.5, 0.08)` | Green left 4px | Success banner |
+
+#### Typography
+
+| Element | Font | Size | Weight | Notes |
+|---|---|---|---|---|
+| Column headers | UI font | `ui_sm` | `FontWeight::SEMIBOLD` | Uppercase optional |
+| Cell data | Grid font (setting) or buffer font | `ui_sm` | `FontWeight::NORMAL` | Monospace for numbers |
+| NULL values | UI font | `ui_sm` | `FontWeight::NORMAL` | Italic, muted |
+| Boolean values | UI font | `ui_sm` | `FontWeight::MEDIUM` | Colored |
+| Tree labels | UI font | `ui_sm` | `FontWeight::NORMAL` | — |
+| Connection names | UI font | `ui_sm` | `FontWeight::SEMIBOLD` | — |
+| Status bar | UI font | `ui_xs` | `FontWeight::NORMAL` | — |
+| Pagination | UI font | `ui_xs` | `FontWeight::NORMAL` | — |
+
+#### Spacing and Sizing
+
+| Element | Value | Notes |
+|---|---|---|
+| Grid cell padding | `px(6.)` horizontal, `px(4.)` vertical | Compact by default |
+| Grid row height | `px(28.)` | Uniform for virtual scrolling |
+| Column min-width | `px(60.)` | Prevents columns from disappearing |
+| Column default-width | Content-fitted or equal distribution | |
+| Explorer indent step | `px(20.)` per level | Matches ProjectPanel |
+| Split handle height | `px(6.)` | Draggable area |
+| Panel min-width | `px(150.)` | For Explorer/ValueEditor |
+| Tab bar height | `Tab::container_height(cx)` | Standard Zed tab height |
+| Connection color dot | `px(6.)` diameter | In tabs and status bar |
+| Edit indicator triangle | `px(6.)` side | Top-left corner of edited cell |
+
+#### Empty States
+
+**No connections:**
+```
+┌─────────────────────────────┐
+│                             │
+│    🔌 No Connections        │
+│                             │
+│    Add a database           │
+│    connection to get        │
+│    started.                 │
+│                             │
+│    [Add Connection]         │
+│                             │
+└─────────────────────────────┘
+```
+
+**No results:**
+```
+┌─────────────────────────────┐
+│                             │
+│    Execute a query to       │
+│    see results here.        │
+│                             │
+│    Ctrl+Enter to run        │
+│                             │
+└─────────────────────────────┘
+```
+
+Uses `Table::empty_table_callback()` for the grid empty state.
+
+### 11. Responsive Behavior
+
+#### Grid Column Layout
+
+- Columns distribute available width proportionally to content
+- Minimum column width: `px(60.)` — below this, horizontal scroll activates
+- Horizontal scrolling managed by `TableInteractionState::scroll_handle`
+- Column resize handles are `px(4.)` wide, visible on hover
+- Double-click resize handle → auto-fit column to content width
+
+#### Explorer Panel Width
+
+| Width Range | Behavior |
+|---|---|
+| > 200px | Full labels + icons + hover actions |
+| 150–200px | Labels truncated with ellipsis |
+| < 150px | Icons only (labels hidden), indent reduced to `px(12.)` |
+| < 100px | Minimum width, panel cannot shrink further |
+
+#### Split Ratio Constraints
+
+- Minimum: 15% for either section (editor or grid)
+- Maximum: 85% for either section
+- Default: 50/50
+- Double-click handle: reset to 50/50
+- Ratio persisted in workspace serialization
+
+#### Window Size Adaptation
+
+- Panels follow Zed's standard dock resize behavior (6px drag handle)
+- At very narrow window widths, panels can be collapsed to icon-only in dock bar
+- Grid pagination bar wraps: info on first line, navigation on second when narrow
+- Modal dialogs have `max_w(px(560.))` and `max_h(vh(0.85))` with scroll
+
+### 12. Commit/Submit Flow for Data Modifications
+
+Since data modifications (INSERT, UPDATE, DELETE) are staged as pending edits,
+the user must explicitly commit them:
+
+#### Pending Changes Indicator
+
+When `pending_edits` is non-empty, show a commit bar above the pagination:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ 3 pending changes (1 insert, 1 update, 1 delete)  [Revert All] [Commit] │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+- "Commit" sends all pending changes as SQL (within a transaction if auto-commit is off)
+- "Revert All" clears all pending edits
+- Individual row revert via context menu
+- If the user tries to close a tab with pending changes, show a confirmation modal
+  (implementing `on_before_dismiss` pattern)
+
+#### Auto-commit Mode
+
+When `DatabaseSettings.auto_commit` is true:
+- Each edit immediately executes the corresponding SQL
+- No commit bar shown
+- Undo sends a reverse SQL statement
+- Setting shown as `[⚡ Auto-commit]` indicator in status bar
+
+### 13. Accessibility Considerations
+
+- All interactive elements have ARIA-equivalent focus management via GPUI's `FocusHandle`
+- Grid cells are navigable via keyboard (never mouse-only interactions)
+- Color is never the sole indicator — always paired with icon or text
+  (e.g., NULL is italic + muted, not just grey; errors have icon + border + text)
+- Screen reader support: column headers announce type, sort state; cells announce value + column name
+- High contrast theme support: all custom colors use theme tokens where possible,
+  fall back to hardcoded hsla only for data-state backgrounds (which use low opacity
+  overlays on top of theme background)
+
+### GPUI Components Reuse Summary
+
+| Zed Component | File | Usage in Database IDE |
+|---|---|---|
+| `Table` + `uniform_list` | `crates/ui/src/components/data_table.rs` | ResultGrid core rendering |
+| `TableInteractionState` | same file | Scroll + focus for grid |
+| `TableColumnWidths` | same file | Resizable columns |
+| `ListItem` | `crates/ui/src/components/list/list_item.rs` | Explorer tree nodes |
+| `ListHeader` | `crates/ui/src/components/list/list_header.rs` | Explorer category headers |
+| `ContextMenu::build()` | `crates/ui/src/components/context_menu.rs` | All right-click menus |
+| `PopoverMenu` | `crates/ui/src/components/popover_menu.rs` | Dropdowns, filter popups |
+| `Popover` | `crates/ui/src/components/popover.rs` | AggregateView float |
+| `Disclosure` | `crates/ui/src/components/disclosure.rs` | SSH/SSL sections in dialog |
+| `Modal` + `ModalHeader` + `ModalFooter` | `crates/ui/src/components/modal.rs` | ConnectionDialog shell |
+| `Tab` + `TabBar` | `crates/ui/src/components/tab.rs` | Driver selector in dialog |
+| `Icon` + `IconName` | `crates/ui/src/components/icon.rs` | All iconography |
+| `Label` | `crates/ui/src/components/label.rs` | All text rendering |
+| `Spinner` | `crates/ui/src/components/spinner.rs` | Loading states |
+| `Panel` trait | `crates/workspace/src/dock.rs` | DatabaseExplorer, ValueEditor |
+| `Item` trait | `crates/workspace/src/item.rs` | QueryEditor |
+| `ToolbarItemView` | `crates/workspace/src/toolbar.rs` | QueryBreadcrumbs, QueryActions |
+| `StatusItemView` | `crates/workspace/src/status_bar.rs` | DatabaseStatusItem |
+| `ModalView` | `crates/workspace/src/modal_layer.rs` | ConnectionDialog |
+| `Entity<Editor>` | `crates/editor/` | SQL editing, inline cells, filters |
+| `SplitEditorView` pattern | `crates/editor/src/split_editor_view.rs` | Drag-to-resize split handle |
+| `initialize_panels()` | `crates/zed/src/zed.rs` (line ~619) | Panel registration |
 
 ---
 
